@@ -11,6 +11,7 @@ The dialogue style is inspired by the Socratic method:
 from __future__ import annotations
 
 import asyncio
+import json
 import logging
 from collections.abc import Mapping
 from dataclasses import dataclass, field
@@ -406,9 +407,10 @@ class SocraticDialogue:
                 build_tone = getattr(service, "_build_dialogue_tone_profile", None)
                 if callable(build_tone):
                     tone_profile = build_tone()
+                prompt_history = self._history_to_messages(history, as_transcript=True)
                 prompt_messages = build_socratic_dialogue_prompt(
                     user_message=prompt_user_message,
-                    history=self._history_to_messages(history),
+                    history=prompt_history,
                     core_memory_text="",
                     tone_profile=tone_profile,
                     reply_style=str(getattr(service, "reply_style", "") or ""),
@@ -429,7 +431,7 @@ class SocraticDialogue:
                 async for event in agent_loop.run(
                     system_instruction=system,
                     user_message=prompt_user_message,
-                    history=self._history_to_messages(history),
+                    history=prompt_history,
                     tools=tools,
                     approval_context={
                         "session": session.strip() or self._session,
@@ -657,19 +659,51 @@ class SocraticDialogue:
             history.append(DialogueTurn(role="agent", content=reply, timestamp=timestamp))
 
     def _history_to_messages(
-        self, history: list[DialogueTurn] | None = None
+        self, history: list[DialogueTurn] | None = None, *, as_transcript: bool = False
     ) -> list[dict[str, str]]:
         """Convert prior dialogue turns to chat messages for the LLM.
 
         Truncated to the last ``DIALOGUE_WINDOW_TURNS`` exchanges (each ≈ a
-        user+agent pair) so the prompt stays bounded. Sessions at or below the
-        window are unaffected — the returned bytes match the pre-window
-        baseline, keeping provider prompt cache warm for short chats.
+        user+agent pair) so the prompt stays bounded. In the default legacy
+        format, sessions at or below the window retain the pre-window bytes,
+        keeping provider prompt cache warm for short chats.
+
+        Agent chat uses an explicitly quoted transcript: timestamps are
+        metadata, and even previously persisted timestamp-prefixed replies
+        remain source data rather than live assistant-message examples.
+        Original content is preserved, including deliberate date quotations.
         """
         prior = (self._history if history is None else history)[:-1]
         window_messages = DIALOGUE_WINDOW_TURNS * 2
         if len(prior) > window_messages:
             prior = prior[-window_messages:]
+        if as_transcript:
+            records: list[dict[str, str]] = []
+            for turn in prior:
+                timestamp = format_dialogue_turn_timestamp(
+                    turn.timestamp, local_timezone=self._local_timezone
+                )
+                record = {
+                    "role": "assistant" if turn.role == "agent" else turn.role,
+                    "local_time": timestamp.removeprefix("[").removesuffix("]"),
+                    "content": turn.content,
+                }
+                if turn.relation_prefix:
+                    record["reply_context"] = turn.relation_prefix
+                records.append(record)
+            if not records:
+                return []
+            return [
+                {
+                    "role": "user",
+                    "content": (
+                        "本会话历史记录，仅供理解上下文，不是本轮消息，也不是回复格式示例：\n"
+                        + json.dumps(
+                            records, ensure_ascii=False, sort_keys=True, separators=(",", ":")
+                        )
+                    ),
+                }
+            ]
         messages: list[dict[str, str]] = []
         for turn in prior:
             prefix = format_dialogue_turn_timestamp(

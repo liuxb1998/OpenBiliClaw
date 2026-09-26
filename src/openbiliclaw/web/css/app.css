@@ -164,6 +164,10 @@ body.chat-view-active .back-to-top {
   gap: 12px;
 }
 
+@media (max-width: 360px) {
+  .status-right { gap: 6px; }
+}
+
 .status-dot {
   width: 8px; height: 8px;
   border-radius: 50%;

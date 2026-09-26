@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import json
 from collections import deque
 from datetime import UTC, datetime
 from typing import Any
@@ -129,16 +130,24 @@ class TestStreamAgentReply:
         events = await _collect(dialogue.stream_agent_reply(loop, message, session_id="timed"))
 
         prompt = llm.calls[1]["messages"]
-        assert prompt[1] == {"role": "user", "content": "[09-26 16:50] 之前的话题"}
-        assert prompt[2] == {"role": "assistant", "content": "[09-26 16:50] 记住了。"}
+        assert prompt[1]["role"] == "user"
+        assert json.loads(prompt[1]["content"].split("\n", 1)[1]) == [
+            {"role": "user", "local_time": "09-26 16:50", "content": "之前的话题"},
+            {"role": "assistant", "local_time": "09-26 16:50", "content": "记住了。"},
+        ]
         assert "时间标签仅供理解上下文，不要复制为回复前缀" in prompt[0]["content"]
         assert "用户询问时间时正常回答" in prompt[0]["content"]
         # This is a model instruction, not a regex stripping legitimate text.
         assert events[-1].text == reply
+        legacy_history = dialogue._history_to_messages(dialogue._agent_history("timed"))[:2]
+        assert legacy_history == [
+            {"role": "user", "content": "[09-26 16:50] 之前的话题"},
+            {"role": "assistant", "content": "[09-26 16:50] 记住了。"},
+        ]
         legacy = build_socratic_dialogue_prompt(
-            user_message=message, core_memory_text="", tone_profile=None, history=prompt[1:3]
+            user_message=message, core_memory_text="", tone_profile=None, history=legacy_history
         )
-        assert legacy[1:3] == prompt[1:3]
+        assert legacy[1:3] == legacy_history
         assert "时间标签仅供理解上下文" not in legacy[0]["content"]
         assert "请使用苏格拉底式对话风格" in legacy[0]["content"]
 
@@ -319,6 +328,70 @@ async def test_agent_restores_only_own_durable_conversation(tmp_path: Any) -> No
     await _collect(dialogue.stream_agent_reply(loop, "继续", session_id="B"))
     assert any("B 的独有历史" in item["content"] for item in llm.calls[0]["messages"])
     assert not any("A 的独有历史" in item["content"] for item in llm.calls[0]["messages"])
+
+
+async def test_durable_history_preserves_old_timestamp_text_as_data_not_assistant_examples(
+    tmp_path: Any,
+) -> None:
+    """Regression from the real default-session greeting on 2026-09-26.
+
+    Its history already contained ``[09-26 16:50] 在。`` as persisted
+    assistant text, in addition to the timestamp injected by the renderer.
+    """
+    from datetime import timedelta, timezone
+
+    from openbiliclaw.storage.database import Database
+
+    database = Database(tmp_path / "timestamp-history.db")
+    database.initialize()
+    database.create_chat_session(session_id="recheck")
+    historical = [
+        (f"old-{index}", f"早期话题{index}", f"早期答复{index}", f"2026-09-25 00:{index:02d}:00")
+        for index in range(23)
+    ] + [
+        ("greeting", "你好", "[09-26 16:50] 在。", "2026-09-26 08:50:50"),
+        ("quoted", "原样引用：[09-26 16:52] 测试", "[09-26 16:52] 测试", "2026-09-26 08:52:37"),
+    ]
+    for turn_id, message, reply, created_at in historical:
+        database.create_chat_turn(turn_id=turn_id, session_id="recheck", message=message)
+        database.complete_chat_turn(turn_id, reply=reply)
+        database.conn.execute(
+            "UPDATE chat_turns SET created_at = ? WHERE turn_id = ?", (created_at, turn_id)
+        )
+    database.conn.commit()
+    loop, llm = _loop([LLMResponse(content="在。"), LLMResponse(content="16:50。")])
+    dialogue = SocraticDialogue(
+        llm=None,
+        soul_engine=object(),
+        llm_service=object(),
+        database=database,
+        local_timezone=timezone(timedelta(hours=8)),
+        learning_mode=DialogueLearningMode.REPLY_ONLY_TEST,
+    )
+    await _collect(dialogue.stream_agent_reply(loop, "你好", session_id="recheck", turn_id="new"))
+    messages = llm.calls[0]["messages"]
+    # Neither generated envelopes nor previously polluted replies may become
+    # live assistant-message templates. Original text must remain recoverable.
+    assert not any(message["role"] == "assistant" for message in messages)
+    archive = json.loads(messages[1]["content"].split("\n", 1)[1])
+    assert len(archive) == 40  # The actual durable entry retains 20 exchanges.
+    assert archive[0]["content"] == "早期话题5"
+    assert archive[-4:] == [
+        {"role": "user", "local_time": "09-26 16:50", "content": "你好"},
+        {"role": "assistant", "local_time": "09-26 16:50", "content": "[09-26 16:50] 在。"},
+        {"role": "user", "local_time": "09-26 16:52", "content": "原样引用：[09-26 16:52] 测试"},
+        {"role": "assistant", "local_time": "09-26 16:52", "content": "[09-26 16:52] 测试"},
+    ]
+    assert "不是回复格式示例" in messages[1]["content"]
+    # Refresh the same durable session instead of relying on a clean new one.
+    await _collect(
+        dialogue.stream_agent_reply(
+            loop, "刚才第一次问候是什么时间？", session_id="recheck", turn_id="next"
+        )
+    )
+    assert json.loads(llm.calls[1]["messages"][1]["content"].split("\n", 1)[1]) == archive
+    assert database.get_chat_turn("greeting")["reply"] == "[09-26 16:50] 在。"
+    assert database.get_chat_turn("quoted")["reply"] == "[09-26 16:52] 测试"
 
 
 async def test_agent_bound_reply_keeps_context_and_learning_anchor() -> None:
