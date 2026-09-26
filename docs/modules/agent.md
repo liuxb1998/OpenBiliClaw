@@ -27,7 +27,8 @@ M9 交付移动 Web（`web/js/views/chat.js`）与插件 popup（`extension/popu
 | M1 原生 function calling | ✅ | 见 [llm 模块](llm.md)：OpenAI 系 chat-completions flavor 原生 FC，其余 provider 走 prompt 模拟兜底 |
 | M1 多跳 AgentLoop | ✅ | `agent/loop.py`：`AgentLoop.run()` 异步生成器逐跳产出事件，默认 64 跳上限（`[agent]` 配置），超限后无工具收尾汇报 |
 | M2 SSE 流式接线 | ✅ | 新端点 `POST /api/chat/agent/stream` 真流式转发 `AgentEvent`；`SocraticDialogue.stream_agent_reply()` 复用 persona prompt / 历史 / 学习队列；loop 事件随 turn 落 `payload.agent_events`；旧 `/api/chat` 与 `/api/chat/stream`（假流式）保持共存 |
-| M3 v1 工具集（14 个） | ✅ | 见下文「v1 标准工具集」：`AgentToolContext` + `build_agent_tool_registry()` 总装，read / soft_write / hard_write 三级权限，handler 全部防御性降级 |
+| M3 扩展工具集（17 个） | ✅ | 见下文「v1 标准工具集」：`AgentToolContext` + `build_agent_tool_registry()` 总装，read / soft_write / hard_write 三级权限，handler 全部防御性降级 |
+| 公开网页与聊天笔记 | ✅ | search_web/read_webpage 按需联网并保留来源；agent_notes 可检索、CAS 更正和审批删除，后续聊天按权限注入有界引用 |
 | 会话聊天风格 | ✅ | 六种表达模板独立于功能角色；会话持久化、发送时冻结，三端选择与示例预览，工具权限保持 |
 | M4 skill 加载与切换 | ✅ | `agent/skill.py`：`SkillDefinition` + `*/SKILL.md` 解析（手写 frontmatter 子集，无 YAML 依赖）+ `load_skill_catalog()`（内置 → `data/skills/` 覆盖，非法文件跳过记日志）；4 个内置 skill；`suggest_skill` 元工具 + 端点 skill 绑定，见下文「Skill 体系（M4）」 |
 | M6 任务中心（durable 后台任务） | ✅ | `agent/tasks.py`：`AgentTaskRunner` 在 `BackgroundTaskRegistry` 登记的 asyncio task 里跑**只读** AgentLoop（`filter_by_permission("read")` ∩ skill 白名单），事件逐步落 `agent_tasks.steps`；写动作只经 `propose_suggestion` 元工具产出结构化建议清单，完成后往来源会话写汇总消息；交互侧另有 `start_background_task` 元工具（同 suggest_skill 确认卡模式）。见下文「任务中心（M6）」 |
@@ -72,8 +73,10 @@ agent/
     ├── common.py        # 共享错误类型（组件缺失）与输出辅助
     ├── context.py       # AgentToolContext + build_agent_tool_registry（v1 总装）
     ├── skill_tools.py   # suggest_skill 元工具（agent 建议切换 skill）
+    ├── web_search_tools.py  # search_web：Exa 公开 MCP
+    ├── web_reading.py       # read_webpage：公开 URL 正文读取
     ├── profile_tools.py     # get_profile
-    ├── memory_tools.py      # read_memory / write_memory / search_history
+    ├── memory_tools.py      # read_memory / write_memory / delete_memory / search_history
     ├── recommendation_tools.py  # get_recommendations / query_discovery_pool
     ├── bilibili_tools.py    # get_watch_history（本地数据层）
     ├── feedback_tools.py    # submit_feedback / save_item（soft_write）
@@ -171,22 +174,26 @@ result = registry.dispatch_sync("save_note", {...})  # 旧同步调用方
 | 工具 | 权限 | 说明 |
 |------|------|------|
 | `get_profile` | read | 当前生效画像（洋葱模型，`SoulEngine.get_profile()` ⊕ 用户覆盖，markdown 渲染） |
-| `read_memory` | read | 记忆五层读取（core 摘要或 event/preference/awareness/insight/soul 原始 JSON，可截断） |
+| `read_memory` | read | 记忆五层/core 摘要；layer=agent_notes 按 key/keyword 检索明确保存的笔记，offset 分页；精确查询保留完整 layer/key/value，转义导致过长时改用原文输出 |
+| `search_web` | read | 按公开 query 搜索网页，返回标题、完整 URL、摘要与来源，失败不伪装成无结果 |
+| `read_webpage` | read | 阅读 HTTP(S) 公开 HTML/文本，逐跳校验并绑定公开 IP，返回最终 URL、标题、正文和截断状态 |
 | `search_history` | read | 历史对话（`chat_turns` 新增 `Database.search_chat_turns()`）+ 行为事件（`query_events`）关键词/时间范围检索 |
 | `get_recommendations` | read | 推荐池头部只读预览（`get_pool_candidates` / `get_pool_candidates_for_platform`），返回内容身份与完整链接供保存使用，不消耗池、不标记已展示 |
 | `get_watch_history` | read | 本地内容历史（clicked/shown/removed 投影）与收藏/稍后再看清单，返回内容身份及实际推荐记录 ID（如有），不触发真实抓取 |
 | `query_discovery_pool` | read | discovery 候选池库存：可服务数、待处理数、有货平台、可选抽样 |
 | `get_config` | read | 配置只读，api_key/cookie/token/password 等键递归打码 |
 | `list_sources` | read | 订阅源列表，含 ID、查询词/URL，支持区分同名订阅后精确开关 |
-| `write_memory` | soft_write | 写记忆到各层 `agent_notes` 命名空间（event/preference/awareness/insight），不覆盖引擎字段，soul 层禁写 |
+| `write_memory` | soft_write | 写记忆到各层 `agent_notes` 命名空间（event/preference/awareness/insight），更正现有项必须提供匹配的 expected_value，不覆盖引擎字段，soul 层禁写 |
 | `submit_feedback` | soft_write | 推荐反馈（like/dislike/dismiss/comment），复用 `POST /api/feedback` 同款 durable 事件流入（event_ingress 幂等 + 推荐行投影 + 轻量认知钩子） |
 | `save_item` | soft_write | 本地收藏/稍后再看（`SavedSyncService.save_local(auto_sync=False)`，不同步平台账号） |
+| `delete_memory` | hard_write | 按 layer/key/expected_value 删除一条聊天笔记，批准时再次核对原值；不删除聊天历史或系统画像 |
 | `create_source` | hard_write | 创建订阅源（M1 已有） |
 | `toggle_source` | hard_write | 订阅源开关（M1 已有） |
 | `update_config` | hard_write | 配置修改（M7 起真写入）：白名单内已存在标量键（文本/数字/布尔），密钥类与路径/存储类一律拒绝；批准后经 API `config_update_hook` 提交单字段补丁，复用设置页保存锁、应用队列与 last-good 回滚；实际热重载失败会返回失败并结束审批为 failed |
 
-上下文策略是「不塞数据，给入口」：工具按需查询系统数据，结果全部有
-长度上限（截断并标注）。
+大体量画像/历史由工具按需查询，结果有长度上限。少量显式保存的聊天笔记
+通过 `render_agent_notes_prompt()` 作为有界 JSON 引用进入当前用户上下文；只有
+chat scope 且当前角色含 read_memory 才注入，不进入 system 指令或学习原始消息。
 
 内容读取工具在每条摘要后提供 JSON「定位信息」：`content_id` /
 `source_platform` / `content_url` / `content_type` / `title` / `author_name`
@@ -224,10 +231,10 @@ source=builtin|custom）与 `SkillCatalog`（`get` / `default` /
 
 | name | 显示名 | 工具白名单 |
 |------|--------|-----------|
-| `taste-companion` | 口味伙伴（默认） | 全部 read + soft_write 共 11 个（无 hard_write） |
-| `taste-explorer` | 口味探寻师 | get_profile / read_memory / write_memory / search_history / submit_feedback（苏格拉底式追问人设） |
-| `bangumi-advisor` | 追番顾问 | get_profile / read_memory / get_recommendations / get_watch_history / save_item / submit_feedback |
-| `system-steward` | 系统管家 | list_sources / get_config + hard_write 三件套（create_source / toggle_source / update_config；人设强调改动需用户批准） |
+| `taste-companion` | 口味伙伴（默认） | 原有查询/反馈/收藏 + search_web/read_webpage + 可审批的 delete_memory |
+| `taste-explorer` | 口味探寻师 | get_profile / read_memory / write_memory / delete_memory / search_history / submit_feedback / search_web / read_webpage（访谈角色） |
+| `bangumi-advisor` | 追番顾问 | get_profile / read_memory / get_recommendations / get_watch_history / save_item / submit_feedback / search_web / read_webpage |
+| `system-steward` | 系统管家 | list_sources / get_config / search_web / read_webpage + hard_write 三件套（create_source / toggle_source / update_config；人设强调改动需用户批准） |
 
 **会话绑定与切换**：`POST /api/chat/agent/stream` 请求体新增可选 `skill`
 字段（空 = 默认口味伙伴，未知名返回 422）。选中 skill 后：loop 的工具集 =
@@ -434,3 +441,19 @@ skill?)` 元工具（read 级、无副作用，注册进每个 skill 子集，�
 `loop_max_steps`（默认 64）、`tool_result_max_chars`（默认 4000）、
 `session_title_enabled`（默认 true）、`task_max_steps`（M6 后台任务跳数预算，
 默认 32）。
+
+### 公开网页与笔记操作边界
+
+`search_web` 使用固定 Exa 公开 MCP 端点 `https://mcp.exa.ai/mcp`，复用现有
+Exa 结果解析器与 `[network]` 出站路由，不依赖本机 mcporter 或新增密钥配置。公开端点有上游限流，依据 [Exa 官方 MCP 文档](https://exa.ai/docs/get-started/exa-mcp)。
+仅发送模型为本次请求给出的 query；没有后台自动附加画像、历史或笔记的逻辑。
+上游限流、协议错误、超时与真正空结果分别报告，不隐式串联多家服务拉长等待。
+
+`read_webpage` 只读取公开 HTTP(S) 的 HTML/纯文本；不会执行页面 JavaScript、
+携带登录 Cookie、访问私网或读取本地文件。每次重定向重新校验地址，连接固定
+到已验证的公开 IP，同时验证原域名 TLS 证书。体积、时间与跳转数均有上限。
+搜索摘要和网页正文都是引用资料，不成为工具授权或修改记忆的指令。
+
+三端继续使用现有工具过程、Markdown 来源链接及审批卡；CLI `chat` 和 OpenClaw
+legacy 对话不切换到 AgentLoop，不在本次新增工具覆盖范围。后台任务保持 read-only，
+可查询公开网页，但不会直接写/删记忆。

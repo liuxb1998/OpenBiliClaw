@@ -405,3 +405,10 @@ scheme 归一化的前提是入口能算出外部有效 host：反向代理保�
 ### 活动动态的交互隔离（2026-09-07）
 
 已实现：`GET /api/activity-feed` 的 runtime、认知和数据库聚合在工作线程完成，异步锁串行进入既有 TTL 缓存，避免并发重复扫描真实候选历史阻塞主 HTTP 事件循环。公开响应结构不变。真实验收见 [报告](../verification/2026-09-07-recommendation-live.md)。
+
+### Agent 网页工具与聊天笔记
+
+既有 `/api/chat/skills` 回显新增 search_web/read_webpage 权限；口味伙伴/探寻师还
+允许 delete_memory。继续使用 durable turn → Agent SSE → 通用工具事件与审批 API，
+不新增另一套聊天端点。delete_memory 由现有 hard_write 审批门拦截，批准时重新
+核对 expected_value，期间笔记已变化则执行失败并保留新值。

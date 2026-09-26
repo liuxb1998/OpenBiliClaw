@@ -104,6 +104,54 @@ async def _collect(stream: Any) -> list[AgentEvent]:
 
 
 class TestStreamAgentReply:
+    @pytest.mark.parametrize(
+        ("skill_name", "scope", "expected"),
+        [
+            ("taste-companion", "chat", True),
+            ("system-steward", "chat", False),
+            ("taste-companion", "probe", False),
+        ],
+    )
+    async def test_saved_notes_are_user_context_only_and_follow_role_permissions(
+        self, tmp_path, skill_name: str, scope: str, expected: bool
+    ) -> None:
+        from types import SimpleNamespace
+
+        from openbiliclaw.memory.manager import MemoryManager
+
+        memory_path = tmp_path / "memory"
+        memory_path.mkdir()
+        (memory_path / "preference.json").write_text(
+            json.dumps(
+                {
+                    "agent_notes": {
+                        "test_snack": {"value": "夜宵喜欢清淡粥", "source": "chat_agent"}
+                    },
+                }
+            ),
+            encoding="utf-8",
+        )
+        memory = MemoryManager(tmp_path)
+        memory.initialize()
+        queue = RecordingSettlementQueue()
+        dialogue = _dialogue(
+            SimpleNamespace(memory=memory), mode=DialogueLearningMode.QUEUED, queue=queue
+        )
+        loop, llm = _loop([LLMResponse(content="好的。")])
+        skill = load_skill_catalog().get(skill_name)
+        assert skill is not None
+        await _collect(
+            dialogue.stream_agent_reply(
+                loop, "简单聊聊", skill=skill, scope=scope, session_id="notes-context"
+            )
+        )
+        messages = llm.calls[0]["messages"]
+        assert ("夜宵喜欢清淡粥" in messages[-1]["content"]) is expected
+        assert "夜宵喜欢清淡粥" not in messages[0]["content"]
+        assert len(llm.calls) == 1
+        assert dialogue._agent_session_histories["notes-context"][0].content == "简单聊聊"
+        assert queue.submissions[0][1]["user_message"] == "简单聊聊"
+
     @pytest.mark.parametrize("persona", CHAT_PERSONAS, ids=lambda persona: persona.id)
     @pytest.mark.parametrize("full_tone_override", [False, True])
     async def test_selected_persona_reaches_model_without_changing_tools_or_call_count(

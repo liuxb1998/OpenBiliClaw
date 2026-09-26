@@ -521,6 +521,62 @@ def _wait_for_approval_status(
 
 
 class TestApprovalApi:
+    @pytest.mark.parametrize("changed_before_approval", [False, True])
+    def test_delete_memory_rechecks_saved_value_when_approval_executes(
+        self, tmp_path: Path, changed_before_approval: bool
+    ) -> None:
+        from openbiliclaw.agent.tools import AgentToolContext, build_agent_tool_registry
+        from openbiliclaw.memory.manager import MemoryManager
+
+        memory = MemoryManager(tmp_path)
+        memory.initialize()
+        registry = build_agent_tool_registry(AgentToolContext(memory_manager=memory))
+        saved = asyncio.run(
+            registry.dispatch(
+                "write_memory", {"layer": "preference", "key": "snack", "value": "清淡粥"}
+            )
+        )
+        assert saved.ok, saved.content
+        app = _approval_app(tmp_path, registry=registry)
+        store = app.state.runtime_context.chat_approval_store
+        approval = store.submit(
+            tool_name="delete_memory",
+            arguments={"layer": "preference", "key": "snack", "expected_value": "清淡粥"},
+            summary="删除夜宵聊天笔记",
+            impact="只删除一条明确保存的笔记",
+        )
+        assert "snack" in memory.get_layer("preference").data["agent_notes"]
+        if changed_before_approval:
+            changed = asyncio.run(
+                registry.dispatch(
+                    "write_memory",
+                    {
+                        "layer": "preference",
+                        "key": "snack",
+                        "value": "番茄面",
+                        "expected_value": "清淡粥",
+                    },
+                )
+            )
+            assert changed.ok, changed.content
+        with TestClient(app) as client:
+            response = client.post(f"/api/chat/approvals/{approval.approval_id}/approve")
+            assert response.status_code == 200
+            settled = _wait_for_approval_status(
+                client, approval.approval_id, {"executed", "failed"}
+            )
+            assert settled["status"] == ("failed" if changed_before_approval else "executed")
+            # Duplicate approval never re-dispatches or erases a changed note.
+            repeated = client.post(f"/api/chat/approvals/{approval.approval_id}/approve")
+            assert repeated.status_code == 200
+        restored = MemoryManager(tmp_path)
+        restored.initialize()
+        notes = restored.get_layer("preference").data["agent_notes"]
+        if changed_before_approval:
+            assert notes["snack"]["value"] == "番茄面"
+        else:
+            assert "snack" not in notes
+
     def _seed_recipe(self, app: Any) -> str:
         database = app.state.runtime_context.database
         recipe = {

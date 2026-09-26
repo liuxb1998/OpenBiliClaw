@@ -52,6 +52,9 @@ tools:
 
 BUILTIN_TOOL_WHITELISTS: dict[str, set[str]] = {
     "taste-companion": {
+        "search_web",
+        "read_webpage",
+        "delete_memory",
         "get_profile",
         "read_memory",
         "write_memory",
@@ -65,6 +68,9 @@ BUILTIN_TOOL_WHITELISTS: dict[str, set[str]] = {
         "save_item",
     },
     "taste-explorer": {
+        "search_web",
+        "read_webpage",
+        "delete_memory",
         "get_profile",
         "read_memory",
         "write_memory",
@@ -72,6 +78,8 @@ BUILTIN_TOOL_WHITELISTS: dict[str, set[str]] = {
         "submit_feedback",
     },
     "bangumi-advisor": {
+        "search_web",
+        "read_webpage",
         "get_profile",
         "read_memory",
         "get_recommendations",
@@ -80,6 +88,8 @@ BUILTIN_TOOL_WHITELISTS: dict[str, set[str]] = {
         "submit_feedback",
     },
     "system-steward": {
+        "search_web",
+        "read_webpage",
         "list_sources",
         "get_config",
         "create_source",
@@ -180,12 +190,17 @@ def test_builtin_whitelists_match_registered_tools() -> None:
     for skill in catalog.definitions:
         missing = set(skill.tools) - set(registry.names)
         assert not missing, f"{skill.name} 白名单引用了未注册的工具: {missing}"
-        # Hard-write tools stay exclusive to the system steward.
+        # System settings remain exclusive to the steward; the two memory
+        # roles can submit approval-gated deletion of their chat notes.
         if skill.name != "system-steward":
             for tool_name in skill.tools:
                 tool = registry.get(tool_name)
                 assert tool is not None
-                assert tool.permission_level != "hard_write"
+                if tool_name == "delete_memory":
+                    assert skill.name in {"taste-companion", "taste-explorer"}
+                    assert tool.permission_level == "hard_write"
+                else:
+                    assert tool.permission_level != "hard_write"
 
 
 def test_user_skill_overrides_builtin(tmp_path: Path, caplog: pytest.LogCaptureFixture) -> None:

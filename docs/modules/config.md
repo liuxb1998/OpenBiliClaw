@@ -1430,3 +1430,10 @@ cookie = ""
 - 非交互终端不会进入引导；服务器脚本、CI 或批量部署仍需预置 `config.toml` 和 Cookie
 - 如需手动编辑容器内配置，可使用 `docker cp` 导出 `/app/runtime/config.toml`，修改后再复制回去
 - 如需彻底清空 Docker 内状态，可执行 `docker compose down -v`
+
+### 聊天网页访问
+
+Agent search_web 使用既有 `[network]` 出站策略连接固定公开 Exa MCP，不新增密钥或配置项；
+免费端点限流直接报告。read_webpage 为避免代理改变已校验目标，使用不继承环境代理的
+公开 IP 绑定直连，只支持标准 HTTP(S) 端口。无法直达、需登录或依赖脚本的正文会明确
+提示限制，不自动调用用户浏览器会话。

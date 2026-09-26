@@ -24,6 +24,8 @@ from .profile_tools import build_profile_tools
 from .recommendation_tools import build_recommendation_tools
 from .registry import ToolRegistry
 from .source_tools import build_source_tool_registry
+from .web_reading import build_web_reading_tools
+from .web_search_tools import build_web_search_tools
 
 
 @dataclass
@@ -72,6 +74,8 @@ def build_agent_tool_registry(ctx: AgentToolContext) -> ToolRegistry:
         build_bilibili_tools,
         build_feedback_tools,
         build_config_tools,
+        build_web_search_tools,
+        build_web_reading_tools,
     ):
         for tool in builder(ctx):
             registry.register(tool)

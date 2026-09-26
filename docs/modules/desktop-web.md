@@ -96,3 +96,10 @@ start_background_task）、会话/任务/审批/skill 列表 markup、异步审�
 `applyApprovalRecordToProcess` 中间态恢复与终态不降级）。
 
 运行：`node --test tests/js/*.test.mjs`
+
+### 网页工具和聊天笔记
+
+当前 Agent 角色提供 search_web/read_webpage 时，继续用已有执行过程与 Markdown 链接
+展示网页资料；共享渲染器也将正文中的裸 http(s) 来源转为可点击链接，跳过代码和已有
+链接，保留 HTML 转义。口味伙伴/探寻师可定位、更正聊天笔记；delete_memory 走现有审批卡，
+待批准不表示已删除，执行时原值冲突则失败并保留新笔记。本次无需额外页面入口。
