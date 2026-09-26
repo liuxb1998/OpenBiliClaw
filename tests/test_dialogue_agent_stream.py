@@ -193,3 +193,74 @@ class TestStreamAgentReply:
         # 会话边界: "本对话/第一回合" means the current session (issue 6).
         assert "会话边界" in system
         assert "当前会话" in system
+
+
+async def test_agent_context_isolated_per_conversation() -> None:
+    loop, llm = _loop(
+        [
+            LLMResponse(content="记住了，A 的暗号是海豚"),
+            LLMResponse(content="B 是新对话"),
+            LLMResponse(content="A 的暗号是海豚"),
+        ]
+    )
+    dialogue = _dialogue(object())
+    await _collect(dialogue.stream_agent_reply(loop, "A 的暗号是海豚", session_id="A"))
+    await _collect(dialogue.stream_agent_reply(loop, "B 的第一条消息", session_id="B"))
+    assert not any("海豚" in item["content"] for item in llm.calls[1]["messages"])
+    await _collect(dialogue.stream_agent_reply(loop, "我的暗号是什么", session_id="A"))
+    assert any("海豚" in item["content"] for item in llm.calls[2]["messages"])
+    assert not any("B 的第一条" in item["content"] for item in llm.calls[2]["messages"])
+
+
+async def test_agent_restores_only_own_durable_conversation(tmp_path: Any) -> None:
+    from openbiliclaw.storage.database import Database
+
+    database = Database(tmp_path / "dialogue.db")
+    database.initialize()
+    for session_id in ("A", "B"):
+        database.create_chat_session(session_id=session_id)
+        database.create_chat_turn(
+            turn_id=session_id, session_id=session_id, message=f"{session_id} 的独有历史"
+        )
+        database.complete_chat_turn(session_id, reply=f"收到 {session_id}")
+    loop, llm = _loop([LLMResponse(content="好的")])
+    dialogue = SocraticDialogue(
+        llm=None,
+        soul_engine=object(),
+        llm_service=object(),
+        database=database,
+        session="popup",
+        learning_mode=DialogueLearningMode.REPLY_ONLY_TEST,
+    )
+    await _collect(dialogue.stream_agent_reply(loop, "继续", session_id="B"))
+    assert any("B 的独有历史" in item["content"] for item in llm.calls[0]["messages"])
+    assert not any("A 的独有历史" in item["content"] for item in llm.calls[0]["messages"])
+
+
+async def test_agent_bound_reply_keeps_context_and_learning_anchor() -> None:
+    from openbiliclaw.soul.dialogue_turn_context import DialogueTurnBinding, DialogueTurnContext
+
+    binding = DialogueTurnBinding.from_context(
+        DialogueTurnContext(
+            reply_to_turn_id="card-1",
+            source_type="card",
+            kind="hypothesis",
+            ref="h1",
+            generation=1,
+            anchor_origin_turn_id="card-1",
+            title="你喜欢安静的科普",
+        )
+    )
+
+    class BoundQueue(RecordingSettlementQueue):
+        def submit(self, kind: Any, payload: dict[str, object], **kwargs: Any) -> object:
+            self.anchor = kwargs["_server_frozen_anchor_snapshot"]
+            return super().submit(kind, payload)
+
+    queue = BoundQueue()
+    dialogue = _dialogue(object(), mode=DialogueLearningMode.QUEUED, queue=queue)
+    loop, llm = _loop([LLMResponse(content="我记住了")])
+    await _collect(dialogue.stream_agent_reply(loop, "是的", dialogue_binding=binding))
+    assert "你喜欢安静的科普" in llm.calls[0]["messages"][-1]["content"]
+    assert queue.submissions[0][1]["dialogue_binding"] == binding.to_mapping()
+    assert queue.anchor.ref == "h1"

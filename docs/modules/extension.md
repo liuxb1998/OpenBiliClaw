@@ -19,6 +19,8 @@
 
 | 子模块 | 状态 | 说明 |
 |------|------|------|
+| 聊一聊会话隔离与流结束校验 | ✅ | popup / 移动 Web 仅在 `done` 后确认流完成；迟到历史与消息按会话隔离，恢复沿用原 turn 的角色；popup 网络断连保持 agent 轮询，仅明确 503 降级旧聊天 |
+| 审批拒绝输入保留 | ✅ | popup / 移动 Web / 桌面共用审批草稿保留助手，周期刷新和流式重绘保留已展开拒绝表单、原因与焦点，终态更新立即移除操作；原因只读取对应 input，避免同名说明元素遮蔽 |
 | 统一品牌图标 | ✅ | Chrome / Edge / Brave / Firefox manifest 使用 16 / 32 / 48 / 128px 精确尺寸图标，side panel 顶部品牌标记、普通透明 PWA 图标、专用不透明 `maskable` / Apple 主屏幕图标、32px 根 favicon、首次设置页、桌面 Web、移动 Web 和 GitHub Pages 官网统一从 `assets/brand/openbiliclaw-icon.png` 派生。源图的半透明边缘已去除旧白底消光色；扩展图标、favicon 与 maskable 图标使用满幅品牌粉底，页面头图容器也用品牌粉承接透明圆角。旧字母 `B`、CSS 圆环和官网重复的内联 SVG favicon 已移除；社交分享图、Chrome Web Store 素材与 README / 官网截图通过 `build_social_preview_assets.py`、`capture_chrome_webstore_ui.py --refresh-docs` 和既有构建脚本确定性重建。 |
 | 8.1 行为采集 | ✅ | `content/kernel.ts` + `shared/platforms/*` + `service-worker.ts` 已接通统一事件链；B 站 / 小红书 / 抖音 / YouTube / X / 知乎 / Linux.do 都通过 `PlatformAdapter` 产出同一 `BehaviorEvent` 形态，平台差异只保留在 selector、内容 ID 和 action 识别中；Reddit 与 Linux.do 另有只读插件任务源；click 监听在 capture 阶段执行，scroll 同时覆盖页面和内部滚动容器 |
 | 8.1 行为采集 | ✅ | `content/kernel.ts` + `shared/platforms/*` + `service-worker.ts` 已接通统一事件链；B 站 / 小红书 / 抖音 / YouTube / X / 知乎 / V2EX 都通过 `PlatformAdapter` 产出同一 `BehaviorEvent` 形态，平台差异只保留在 selector、内容 ID 和 action 识别中；Reddit 通过插件任务源接入初始化 saved/upvoted/subscribed 信号和 discovery search/hot/subreddit/related；V2EX 普通页面只采集被动阅读行为，任务页由独立 dispatcher 执行四个只读 bootstrap scope；click 监听在 capture 阶段执行，scroll 同时覆盖页面和内部滚动容器 |
@@ -221,6 +223,25 @@ extension/
 ```
 
 ## 当前能力
+
+### 聊一聊会话隔离与断线恢复
+
+移动 Web 与 popup 的 `streamAgentChatTurn()` 只有收到终端 `done` 才成功返回；
+仅收到 `final` 后 EOF 会作为连接中断处理，由 durable 历史恢复真实终态。
+popup 仅在明确 503 时回退旧聊天端点，普通网络中断继续轮询原 agent turn，
+恢复时使用该 turn 保存的 `session_id` / `payload.agent_skill`。
+
+两端历史请求保存会话和请求代次，切换会话立即发起新快照，迟到的旧响应不覆盖
+当前会话。popup 的迟到流事件和 turn 更新也按来源会话过滤；移动 Web 旧流结束
+不会解锁另一个仍在回复的会话。角色选择仍按会话保存，当前回合完成不撤回下一回合的选择。
+
+回归入口：`tests/js/chat-agent-stream-integrity.test.mjs` 和
+`tests/js/chat-session-isolation.test.mjs`，通过实际 API 读流与三端交互函数验证
+提前 EOF、会话切换竞态、迟到消息与角色隔离。
+
+共享 `captureApprovalDrafts(root)` / `restoreApprovalDrafts(root, drafts)` 在重绘前后
+保留正在编辑的审批拒绝输入（DOM 节点、内容、焦点），适用于待审批列表与过程卡；
+`tests/js/chat-approval-drafts.test.mjs` 覆盖草稿保留与终态优先。
 
 ### `content/kernel.ts`
 

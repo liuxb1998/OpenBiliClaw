@@ -267,6 +267,23 @@ async def _collect(loop: AgentLoop, **kwargs: Any) -> list[AgentEvent]:
 
 
 class TestLoopApprovalInterception:
+    async def test_invalid_hard_write_arguments_do_not_create_approval(self) -> None:
+        executed: list[dict[str, Any]] = []
+        store = ApprovalStore()
+        llm = FakeAgentLLM(
+            [
+                LLMResponse(content="", tool_calls=[_hard_write_call({"id": 123})]),
+                LLMResponse(content="请提供正确的订阅 ID"),
+            ]
+        )
+        loop = AgentLoop(llm, ToolRegistry([_hard_write_tool(executed)]), approval_gate=store)
+        events = await _collect(loop, system_instruction="s", user_message="禁用订阅")
+        assert [event.type for event in events] == ["tool_call", "tool_result", "final"]
+        assert not events[1].ok
+        assert "参数校验失败" in events[1].text
+        assert executed == []
+        assert store.list() == []
+
     async def test_hard_write_is_parked_not_executed(self) -> None:
         executed: list[dict[str, Any]] = []
         store = ApprovalStore()
@@ -755,6 +772,7 @@ class TestApprovalApi:
                     "scope": "chat",
                     "message": "禁用这个源",
                     "streaming": True,
+                    "skill": "system-steward",
                 },
             )
             assert created.status_code == 200

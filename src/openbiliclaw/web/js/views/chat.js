@@ -101,6 +101,8 @@ const {
   agentEventsFromTurn,
   agentRunFromEvents,
   createAgentRun,
+  captureApprovalDrafts,
+  restoreApprovalDrafts,
   isAgentTaskActive,
   isAgentTaskSummaryTurn,
   isApprovalTerminalStatus,
@@ -124,6 +126,7 @@ let userScrolledUp = false;
 const CHAT_HISTORY_REFRESH_INTERVAL_MS = 2500;
 let historyRefreshTimer = null;
 let historyRefreshInFlight = false;
+let historyRefreshGeneration = 0;
 let visibilityResumeBound = false;
 let lastHistorySignature = null;
 let pendingConfirmationRefreshTimer = null;
@@ -506,7 +509,9 @@ function updateAgentRunDom(turnId) {
     const thinkingBubble = container.querySelector(".chat-bubble.thinking");
     container.insertBefore(slot, thinkingBubble || null);
   }
+  const approvalDrafts = captureApprovalDrafts(slot);
   slot.innerHTML = renderAgentRunMarkup(run, { collapsed: run.settled });
+  restoreApprovalDrafts(slot, approvalDrafts);
   if (!userScrolledUp || isNearChatBottom(messages)) {
     requestAnimationFrame(() => {
       messages.scrollTop = messages.scrollHeight;
@@ -573,7 +578,7 @@ async function handleApprovalAction(button) {
   if (action === "reject") {
     card.querySelector(".agent-approval-reject")?.removeAttribute("hidden");
     card.querySelector(".agent-approval-actions")?.setAttribute("hidden", "");
-    card.querySelector(".agent-approval-reason")?.focus();
+    card.querySelector("input.agent-approval-reason")?.focus();
     return;
   }
   if (action === "reject-cancel") {
@@ -603,7 +608,7 @@ async function handleApprovalAction(button) {
         setDialogueStatus(ok ? "已批准并执行。" : "批准了，但执行失败。", ok ? "success" : "error");
       }
     } else if (action === "reject-submit") {
-      const reason = card.querySelector(".agent-approval-reason")?.value?.trim() || "";
+      const reason = card.querySelector("input.agent-approval-reason")?.value?.trim() || "";
       await rejectChatApproval(approvalId, reason);
       markApprovalCardSettled(card, "已拒绝，不会执行。", true);
       setRunApprovalStatus(approvalId, "rejected");
@@ -817,6 +822,8 @@ async function switchSession(sessionId) {
     return;
   }
   activeSessionId = sessionId;
+  historyRefreshGeneration += 1;
+  historyRefreshInFlight = false;
   try {
     globalThis.localStorage?.setItem(CHAT_SESSION_STORAGE_KEY, sessionId);
   } catch { /* storage unavailable */ }
@@ -824,7 +831,7 @@ async function switchSession(sessionId) {
   historyLoaded = false;
   lastHistorySignature = null;
   pendingTurnId = null;
-  sending = false;
+  sending = [...streamingTurnIds].some((id) => agentRunsByTurnId.get(id)?.sessionId === sessionId);
   sessionsDrawerOpen = false;
   renderAgentOverlays();
   render();
@@ -1027,6 +1034,7 @@ function renderAgentOverlays() {
 
 function render() {
   if (!$root) return;
+  const approvalDrafts = captureApprovalDrafts($root);
   const previousMessages = $root.querySelector("#chat-messages");
   const previousPendingList = $root.querySelector("#mobile-chat-pending-list");
   const previousInput = $root.querySelector("#chat-input");
@@ -1192,6 +1200,7 @@ function render() {
   shell.appendChild(status);
 
   $root.appendChild(shell);
+  restoreApprovalDrafts($root, approvalDrafts);
 
   for (const details of messages.querySelectorAll(".dialogue-evidence")) {
     const turnId = details.closest("[data-dialogue-turn-id]")?.dataset.dialogueTurnId || "";
@@ -1255,7 +1264,7 @@ function trackPendingHistoryTurn(nextTurns) {
   // streaming turn means the previous stream died with the page); the
   // durable scheduler skips them, so polling alone would never settle.
   if (agentLoopAvailable) {
-    void driveAgentStream(last.turn_id, last.message || "");
+    void driveAgentStream(last.turn_id, last.message || "", last);
     return;
   }
   pendingTurnId = last.turn_id;
@@ -1276,11 +1285,13 @@ function finalizeAgentTurn(turnId, { reply = "", error = "" } = {}) {
     }
   }
   streamingTurnIds.delete(turnId);
-  sending = false;
+  sending = [...streamingTurnIds].some((id) => agentRunsByTurnId.get(id)?.sessionId === activeSessionId);
 }
 
 async function finalizeAgentTurnSuccess(turnId, reply) {
+  const sessionId = agentRunsByTurnId.get(turnId)?.sessionId;
   finalizeAgentTurn(turnId, { reply });
+  if (sessionId && sessionId !== activeSessionId) return;
   userScrolledUp = false;
   setDialogueStatus("这句已经记下了。", "success");
   render();
@@ -1295,17 +1306,20 @@ async function finalizeAgentTurnSuccess(turnId, reply) {
   await loadHistory();
 }
 
-async function driveAgentStream(turnId, message) {
+async function driveAgentStream(turnId, message, sourceTurn = null) {
   if (streamingTurnIds.has(turnId)) return;
   streamingTurnIds.add(turnId);
-  sending = true;
   const run = createAgentRun();
+  const turn = sourceTurn || turns.find((item) => item.turn_id === turnId);
+  const sessionId = turn?.session_id || activeSessionId;
+  if (sessionId === activeSessionId) sending = true;
+  run.sessionId = sessionId;
   agentRunsByTurnId.set(turnId, run);
   try {
     const done = await streamAgentChatTurn({
       turnId,
-      sessionId: activeSessionId,
-      skill: currentSkillName(),
+      sessionId,
+      skill: turn?.payload?.agent_skill || "",
       session: "popup",
       message,
       onEvent(name, data) {
@@ -1328,6 +1342,7 @@ async function driveAgentStream(turnId, message) {
       ? String(error.message || "对话失败了，请稍后重试。")
       : "连接中断了，可以重试。";
     finalizeAgentTurn(turnId, { error: messageText });
+    if (sessionId !== activeSessionId) return;
     setDialogueStatus(messageText, "error");
     render();
   }
@@ -1389,6 +1404,8 @@ async function handleSend() {
   if (!text || sending) return;
 
   sending = true;
+  const sessionId = activeSessionId;
+  const skill = currentSkillName();
   const turnId = `m-${Date.now()}-${Math.random().toString(36).slice(2, 8)}`;
   const replyToTurnId = dialogueContextSelection?.reply_to_turn_id || "";
 
@@ -1396,6 +1413,7 @@ async function handleSend() {
   input.value = "";
   turns.push({
     turn_id: turnId,
+    session_id: sessionId,
     message: text,
     response: null,
     status: "pending",
@@ -1406,22 +1424,23 @@ async function handleSend() {
   render();
 
   try {
-    await startChatTurn({
+    const turn = await startChatTurn({
       turnId,
       ...chatSession(),
       replyToTurnId,
       message: text,
-      sessionId: activeSessionId,
-      skill: currentSkillName(),
+      sessionId,
+      skill,
       streaming: agentLoopAvailable,
     });
     if (agentLoopAvailable) {
-      await driveAgentStream(turnId, text);
-    } else {
+      await driveAgentStream(turnId, text, turn);
+    } else if (sessionId === activeSessionId) {
       pendingTurnId = turnId;
       pollForResponse();
     }
   } catch (error) {
+    if (sessionId !== activeSessionId) return;
     const t = turns.find((t) => t.turn_id === turnId);
     if (t) { t.status = "error"; t.error = "\u53D1\u9001\u5931\u8D25"; }
     retainedDraft = text;
@@ -1433,6 +1452,7 @@ async function handleSend() {
 
 async function retryTurn(failedTurn) {
   if (sending) return;
+  const sessionId = failedTurn.session_id || activeSessionId;
   failedTurn.status = "pending";
   failedTurn.error = "";
   retainedDraft = "";
@@ -1442,15 +1462,18 @@ async function retryTurn(failedTurn) {
   try {
     await startChatTurn({
       turnId: failedTurn.turn_id,
+      sessionId,
       ...chatSession(failedTurn.scope || "chat"),
       message: failedTurn.message,
       subjectId: failedTurn.subject_id || "",
       subjectTitle: failedTurn.subject_title || "",
       replyToTurnId: failedTurn.reply_to_turn_id || "",
     });
+    if (sessionId !== activeSessionId) return;
     pendingTurnId = failedTurn.turn_id;
     pollForResponse();
   } catch (error) {
+    if (sessionId !== activeSessionId) return;
     failedTurn.status = "error";
     failedTurn.error = "\u91CD\u8BD5\u5931\u8D25";
     sending = false;
@@ -1462,6 +1485,7 @@ async function retryTurn(failedTurn) {
 
 function updateDialogueTurn(turn) {
   if (!turn?.turn_id) return;
+  if (turn.session_id && turn.session_id !== activeSessionId) return;
   const normalized = normalizeChatTurn(turn);
   const index = turns.findIndex((item) => item?.turn_id === normalized.turn_id);
   if (index >= 0) turns[index] = normalized;
@@ -1587,11 +1611,15 @@ async function handlePendingConfirmationOpen(button) {
 
 function pollForResponse() {
   if (!pendingTurnId) return;
+  const turnId = pendingTurnId;
+  const sessionId = activeSessionId;
   clearTimeout(pollTimer);
   pollTimer = setTimeout(async () => {
+    if (turnId !== pendingTurnId || sessionId !== activeSessionId) return;
     try {
-      const turn = normalizeChatTurn(await fetchChatTurn(pendingTurnId));
-      const idx = turns.findIndex((t) => t.turn_id === pendingTurnId);
+      const turn = normalizeChatTurn(await fetchChatTurn(turnId));
+      if (turnId !== pendingTurnId || sessionId !== activeSessionId) return;
+      const idx = turns.findIndex((t) => t.turn_id === turnId);
       if (idx >= 0) turns[idx] = turn;
 
       if (turn.status === "done" || turn.status === "completed" || turn.response) {
@@ -1611,7 +1639,7 @@ function pollForResponse() {
         pollForResponse();
       }
     } catch {
-      pollForResponse();
+      if (turnId === pendingTurnId && sessionId === activeSessionId) pollForResponse();
     }
   }, 1500);
 }
@@ -1816,13 +1844,15 @@ async function loadHistory() {
     return;
   }
   historyRefreshInFlight = true;
+  const sessionId = activeSessionId;
+  const generation = ++historyRefreshGeneration;
   const existingMessages = document.getElementById("chat-messages");
   const shouldStickToBottom =
     !(existingMessages instanceof HTMLElement) || isChatMessagesNearBottom(existingMessages);
   const previousScrollTop = existingMessages instanceof HTMLElement ? existingMessages.scrollTop : 0;
   try {
     const [historyResult, pendingResult, approvalsResult] = await Promise.allSettled([
-      fetchChatSessionDetail(activeSessionId, { limit: 100 }).catch(async (error) => {
+      fetchChatSessionDetail(sessionId, { limit: 100 }).catch(async (error) => {
         // Pre-M5 backends have no session detail endpoint; fall back to the
         // legacy flat history so the tab keeps working against older builds.
         if (Number(error?.status) === 404 || Number(error?.status) === 405) {
@@ -1833,6 +1863,7 @@ async function loadHistory() {
       fetchPendingConfirmations({ session: "popup" }),
       refreshApprovals(),
     ]);
+    if (generation !== historyRefreshGeneration || sessionId !== activeSessionId) return;
     let changed = false;
     if (historyResult.status === "fulfilled") {
       const data = historyResult.value;
@@ -1896,6 +1927,7 @@ async function loadHistory() {
   } catch {
     // Keep the last durable snapshot while offline.
   } finally {
+    if (generation !== historyRefreshGeneration || sessionId !== activeSessionId) return;
     historyRefreshInFlight = false;
     // Even a failed first fetch must clear the loading indicator; the
     // periodic sync repaints with real data once the backend responds.

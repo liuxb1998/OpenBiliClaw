@@ -1001,7 +1001,8 @@ async function readAgentSseStream(response, onEvent, watchdog) {
 /**
  * Stream one multi-hop agent turn (POST /api/chat/agent/stream).
  * ``onEvent(eventName, data)`` receives every AgentEvent; resolves with the
- * terminal ``done`` payload or null. Throws with ``status === 503`` when the
+ * terminal ``done`` payload; EOF without it rejects as an interrupted stream.
+ * Throws with ``status === 503`` when the
  * loop is disabled so callers can fall back to the legacy stream; an SSE
  * ``error`` frame rejects with ``agentStreamError = true``. A read watchdog
  * aborts the request when no byte arrives within the watchdog window.
@@ -1035,6 +1036,7 @@ export async function streamAgentChatTurn({
     }
     onEvent?.(name, data);
   }, watchdog);
+  if (!donePayload) throw new Error("对话连接已中断，等待历史恢复。");
   return donePayload;
 }
 

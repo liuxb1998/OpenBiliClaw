@@ -536,3 +536,173 @@ def test_chat_agent_ping_endpoint_streams_numbered_events(
     assert [data["seq"] for _event, data in events] == list(
         range(1, app_module._SSE_PING_EVENT_COUNT + 1)
     )
+
+
+def test_agent_stream_retry_replays_completed_turn_without_reexecuting(tmp_path: Path) -> None:
+    dialogue = FakeAgentDialogue(_multi_hop_script())
+    app = _app(tmp_path, dialogue)
+    payload = {"turn_id": "retry-turn", "message": "我订阅了什么？", "streaming": True}
+    with TestClient(app) as client:
+        assert client.post("/api/chat/turns", json=payload).status_code == 200
+        first = client.post("/api/chat/agent/stream", json=payload)
+        second = client.post("/api/chat/agent/stream", json=payload)
+    assert _parse_sse(second.text) == _parse_sse(first.text)
+    assert len(dialogue.agent_calls) == 1
+
+
+def test_agent_stream_rejects_unknown_or_conflicting_turn_identity(tmp_path: Path) -> None:
+    dialogue = FakeAgentDialogue(_multi_hop_script())
+    app = _app(tmp_path, dialogue)
+    with TestClient(app) as client:
+        missing = client.post(
+            "/api/chat/agent/stream", json={"turn_id": "missing", "message": "你好"}
+        )
+        assert missing.status_code == 404
+        client.post(
+            "/api/chat/turns",
+            json={"turn_id": "identity-turn", "message": "原始问题", "streaming": True},
+        )
+        conflict = client.post(
+            "/api/chat/agent/stream",
+            json={"turn_id": "identity-turn", "message": "另一个问题"},
+        )
+        assert conflict.status_code == 409
+    assert dialogue.agent_calls == []
+
+
+def test_agent_stream_uses_durable_skill_when_retry_omits_it(tmp_path: Path) -> None:
+    dialogue = FakeAgentDialogue([AgentEvent(type="final", text="好的")])
+    app = _app(tmp_path, dialogue)
+    with TestClient(app) as client:
+        client.post(
+            "/api/chat/turns",
+            json={
+                "turn_id": "skill-turn",
+                "message": "你好",
+                "streaming": True,
+                "skill": "system-steward",
+            },
+        )
+        response = client.post(
+            "/api/chat/agent/stream", json={"turn_id": "skill-turn", "message": "你好"}
+        )
+    assert _parse_sse(response.text)[-1][1]["skill"] == "system-steward"
+    assert dialogue.agent_calls[0]["skill"].name == "system-steward"
+
+
+async def test_agent_stream_disconnect_keeps_single_execution_running(tmp_path: Path) -> None:
+    from openbiliclaw.api.app import ChatTurnIn
+
+    dialogue = SlowAgentDialogue(gap_seconds=0.05)
+    app = _app(tmp_path, dialogue)
+    endpoints = {
+        getattr(route, "path", ""): route.endpoint
+        for route in app.routes
+        if "POST" in getattr(route, "methods", ())
+    }
+    payload = ChatTurnIn(turn_id="disconnect-turn", message="你好", streaming=True)
+    await endpoints["/api/chat/turns"](payload)
+    response = await endpoints["/api/chat/agent/stream"](payload)
+    iterator = response.body_iterator
+    first = await anext(iterator)
+    assert "thinking" in first
+    await iterator.aclose()
+    await asyncio.sleep(0.15)
+    row = app.state.runtime_context.database.get_chat_turn("disconnect-turn")
+    assert row["status"] == "completed"
+    assert row["reply"] == "想好了"
+    assert len(dialogue.agent_calls) == 1
+
+
+async def test_concurrent_agent_streams_execute_durable_turn_once(tmp_path: Path) -> None:
+    from openbiliclaw.api.app import ChatTurnIn
+
+    dialogue = SlowAgentDialogue(gap_seconds=0.05)
+    app = _app(tmp_path, dialogue)
+    endpoints = {
+        route.path: route.endpoint
+        for route in app.routes
+        if "POST" in getattr(route, "methods", ())
+    }
+    payload = ChatTurnIn(turn_id="concurrent-turn", message="你好", streaming=True)
+    await endpoints["/api/chat/turns"](payload)
+
+    async def consume() -> list[str]:
+        response = await endpoints["/api/chat/agent/stream"](payload)
+        return [frame async for frame in response.body_iterator]
+
+    first, second = await asyncio.gather(consume(), consume())
+    assert first == second
+    assert len(dialogue.agent_calls) == 1
+
+
+def test_streaming_turn_rejects_invalid_skill_before_persisting(tmp_path: Path) -> None:
+    app = _app(tmp_path, FakeAgentDialogue([]))
+    with TestClient(app) as client:
+        response = client.post(
+            "/api/chat/turns",
+            json={"turn_id": "bad-skill", "message": "你好", "streaming": True, "skill": "missing"},
+        )
+        assert response.status_code == 422
+    assert app.state.runtime_context.database.get_chat_turn("bad-skill") is None
+
+
+async def test_agent_stream_preserves_approval_result_during_execution(tmp_path: Path) -> None:
+    from openbiliclaw.agent.approvals import ApprovalStore
+    from openbiliclaw.api.app import ChatTurnIn
+
+    app = _app(tmp_path, SlowAgentDialogue(gap_seconds=0.05))
+    endpoints = {
+        route.path: route.endpoint
+        for route in app.routes
+        if "POST" in getattr(route, "methods", ())
+    }
+    payload = ChatTurnIn(turn_id="approval-stream", message="你好", streaming=True)
+    await endpoints["/api/chat/turns"](payload)
+    store = ApprovalStore()
+    app.state.runtime_context.chat_approval_store = store
+    approval = store.submit(
+        tool_name="toggle_source",
+        arguments={"id": "test-source", "enabled": False},
+        summary="关闭来源",
+        reason="用户请求",
+        impact="来源停用",
+        session="popup",
+        session_id="default",
+        turn_id=payload.turn_id,
+    )
+    response = await endpoints["/api/chat/agent/stream"](payload)
+    iterator = response.body_iterator
+    assert "thinking" in await anext(iterator)
+    await endpoints["/api/chat/approvals/{approval_id}/reject"](approval.approval_id, None)
+    frames = [frame async for frame in iterator]
+    assert "done" in frames[-1]
+    row = app.state.runtime_context.database.get_chat_turn(payload.turn_id)
+    assert [event["type"] for event in row["payload"]["agent_events"]] == [
+        "thinking",
+        "approval_result",
+        "final",
+    ]
+
+
+def test_agent_stream_applies_scoped_success_effects_once(tmp_path: Path) -> None:
+    app = _app(tmp_path, FakeAgentDialogue([AgentEvent(type="final", text="谢谢反馈")]))
+    updates: list[dict[str, Any]] = []
+    app.state.runtime_context.memory_manager = SimpleNamespace(
+        load_cognition_updates=lambda: list(updates),
+        save_cognition_updates=lambda items: updates.__setitem__(slice(None), items),
+    )
+    payload = {
+        "turn_id": "delight-stream",
+        "message": "这个不错",
+        "streaming": True,
+        "scope": "delight",
+        "subject_id": "video-1",
+        "subject_title": "安静科普",
+    }
+    with TestClient(app) as client:
+        assert client.post("/api/chat/turns", json=payload).status_code == 200
+        assert client.post("/api/chat/agent/stream", json=payload).status_code == 200
+        assert client.post("/api/chat/agent/stream", json=payload).status_code == 200
+    assert len(updates) == 1
+    assert "安静科普" in updates[0]["summary"]

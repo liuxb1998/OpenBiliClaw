@@ -73,6 +73,7 @@
 
 | 功能 | 状态 | 说明 |
 |------|------|------|
+| 待确认列表批量可见性读取 | ✅ | `get_chat_confirmation_refs(session=...)` 用一次连接/查询读取当前 surface 已打开的活动对象，过滤条件与逐 ref 的 `get_chat_confirmation_turn()` 一致；避免数百个待聊对象每次轮询都创建数百个 SQLite 连接 |
 | 推荐读取事务内复用 | ✅ | 隔离快照和库存读取复用同一事务的动态阈值及相同 SQL 原始行；每次仍执行完整资格过滤与独立 topic window，事务结束清空。 |
 | Tailnet 节点身份 / helper / 待用凭据迁移隔离 | ✅ | `data/tailnet/` 同时属于导出排除根与目标应用保留根；`.obcbackup` 不含 tsnet 私钥、状态或 `.bootstrap-credential.json`。后者只在本机设置页提交后以私有权限等待下一次启动，仅在 helper 进入 `ready` 后删除（失败/卡住保留以便重试）。目标保留根含嵌套 symlink 时 fail closed。`data/bin/` 的任何大小写变体在导出与导入都被排除；只保留目标机 exact native helper 普通文件，POSIX 还要求原文件可执行再恢复 `0700`，来源包不能迁入 executable。 |
 | 观看完播判定（2026-07-27+） | ✅ | `events.inferred_satisfaction` 现在也覆盖 `view`：`sources/event_format._classify_view_completion` **只判正向**——完播 ≥`_FINISHED_WATCH_MIN_RATIO`（0.8）且观看 ≥15 秒记 `positive/finished_watch`，其余保持 `unknown/fallback`。低完播刻意不判负（自动播放 / 误点 / 预告 / 重看进度重置都长这样），否则会污染 `recent_negative_exemplars` 并影响内容评估。阈值校准见常量注释；改动 `watch_seconds` 来源后需重新校准 |
@@ -188,9 +189,15 @@ changed = db.complete_chat_turn(turn_id, reply=reply)  # pending -> completed CA
 failed = db.fail_chat_turn(turn_id, error=safe_error)  # pending -> failed CAS
 page = db.list_pending_chat_turn_page(after_rowid=0, limit=500)
 depth = db.count_pending_chat_turns()
+visible_refs = db.get_chat_confirmation_refs(session="popup")
 ```
 
 两个终态写都只允许 pending 行变化并返回 `bool`；调用方在 `False` 时重读行，已有终态视为幂等完成，仍为 pending 则按持久化瞬态故障重试。恢复 page 按 rowid 严格升序，不能用 `created_at` 单独排序（SQLite 时间戳可能同秒）。
+
+`get_chat_confirmation_refs()` 返回该 surface 中已完成且仍活动的确认对象 ref
+集合：hypothesis card 必须为 pending/discussing，confusion 必须是 question，
+且 `payload.ref` 与 `subject_id` 一致。API 每轮读取此集合后过滤已打开对象；
+不会缓存卡片状态，也不改变其它 surface 的可见性。
 
 ### 对象结算 winner 收据
 

@@ -3689,6 +3689,41 @@ class Database:
         finally:
             conn.close()
 
+    def get_chat_confirmation_refs(self, *, session: str) -> set[str]:
+        """Read active confirmation identities for one surface in a single query.
+
+        Uses the same scope, status and payload conditions as
+        ``get_chat_confirmation_turn`` without opening one connection per
+        hypothesis when a chat client polls its pending-confirmation list.
+        """
+        conn = self.open_connection()
+        try:
+            rows = conn.execute(
+                """
+                SELECT DISTINCT subject_id
+                FROM chat_turns
+                WHERE session = ?
+                  AND status = 'completed'
+                  AND json_valid(payload)
+                  AND json_extract(payload, '$.ref') = subject_id
+                  AND (
+                        (
+                            scope = 'hypothesis'
+                            AND json_extract(payload, '$.type') = 'card'
+                            AND json_extract(payload, '$.state') IN ('pending', 'discussing')
+                        )
+                        OR (
+                            scope = 'confusion'
+                            AND json_extract(payload, '$.type') = 'question'
+                        )
+                      )
+                """,
+                (session or "popup",),
+            ).fetchall()
+            return {str(row["subject_id"]) for row in rows}
+        finally:
+            conn.close()
+
     def get_chat_confirmation_attachment(
         self,
         *,

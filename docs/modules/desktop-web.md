@@ -19,6 +19,8 @@
 | M8 审批卡 | ✅ | `approval_request` 渲染审批卡（summary+参数+impact，批准并执行/拒绝可填理由）；侧栏「待审批」入口带未读 badge（轮询 `?status=pending`，抽屉并列展示 executing 记录）；approve 端点异步执行：批准只入队，卡片就地转「执行中…」（按钮移除防重复点击），终态由 2.5s 轮询 `GET /api/chat/approvals`（executing 列表 + 全量快照）落到「已批准并执行」（含 result 摘要）或「已批准，但执行失败」（含 error 详情）；刷新/回放时 executing 记录覆盖归约出的 pending 卡恢复中间态；旧协议（响应无 `queued` 字段、同步返回 ok/result）按 `normalizeApproveResponse` 兜底直接显示结果；回放里 `approval_result` 显示审批结局与执行结果 |
 | M8 任务中心 | ✅ | 侧栏入口 + 右侧抽屉：任务列表（状态/进度/取消）、详情复用过程流组件渲染 `steps`、完成后 report + 建议清单（逐项确认：soft_write「确认执行」/ hard_write「去对话确认」，v1 统一落成来源会话里的结构化指令消息）；`start_background_task` 确认卡；`agent_task_summary` turn 渲染系统汇总卡 |
 | M8 回退与兼容 | ✅ | 探测 `GET /api/chat/skills` 失败 → legacy 模式（布局与行为与 M8 前完全一致）；agent 流 503（`loop_enabled=false`）时当轮回退旧 `/api/chat/stream` 假流式；delight/探针内嵌聊天、假设卡片、待聊确认、对话上下文引用等旧功能不动 |
+| 会话与流结束隔离 | ✅ | SSE 必须收到 `done` 才确认完成，提前 EOF 走历史恢复；历史快照按来源会话与请求代次校验；live 回复只在来源会话展示，旧回合 `done.skill` 不覆盖用户中途切换的角色 |
+| 审批拒绝草稿 | ✅ | 与移动 Web / popup 共用 `agent-chat.js` 的拒绝编辑保留助手，轮询和过程重绘保留原因输入与焦点；终态更新不会复活旧操作按钮 |
 
 ## 模块结构
 
@@ -42,6 +44,9 @@ web/desktop/
 > 抽屉形态），v1 保持独立实现。后续可考虑把 SSE 解析与事件归约两层收敛到
 > 共享模块，桌面只保留 markup。
 
+桌面也加载 `/shared/agent-chat.js` 的 `captureApprovalDrafts` /
+`restoreApprovalDrafts`，用于在 DOM 重绘前后保留用户正在编辑的拒绝原因。
+
 ## 关键交互接线（app.js）
 
 - **模式探测**：首次进入聊天 tab 时 `initDesktopAgentChat()` 拉
@@ -53,11 +58,14 @@ web/desktop/
   `POST /api/chat/agent/stream` 的 SSE；每个事件经
   `OpenBiliClawChatAgentCore.createSseParser` 解析后 apply 进 live 过程模型并
   重渲染。503 时 `legacyStreamForTurn()` 复用旧假流式端点完成同一 turn。
+  `streamAgentChatTurn()` 在缺少 `done`/明确 `error` 的 EOF 上抛出断连错误，
+  不把仅有 `final` 的答复当作持久完成确认；live 对象保存发送时的会话和角色。
 - **历史**：agent 模式下 `refreshDialogueTurns()` 改拉
   `GET /api/chat/sessions/{id}?limit=100`（默认会话收编 legacy turn），
   `selectDialogueTurns` 过滤口径不变；带 `agent_events` 的 turn 由
   `desktopAgentTurnMarkup()` 渲染为「用户气泡 + 折叠过程 + 答复气泡」。
   轮询重渲染时保留过程折叠组件与证据的展开状态（`agentDetailKey`）。
+  异步返回必须匹配当前会话和最新请求代次，避免切换会话后的旧请求覆盖新历史。
 - **事件委托**：`#chatLog` / `#chatApprovalsBody` / `#chatTaskCenterBody`
   统一走 `handleAgentSurfaceClick()`（审批 approve/reject/confirm-reject、
   skill 建议 accept/dismiss、后台任务确认卡、建议清单确认、任务详情打开）；

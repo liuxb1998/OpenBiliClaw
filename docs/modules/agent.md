@@ -154,20 +154,26 @@ result = registry.dispatch_sync("save_note", {...})  # 旧同步调用方
 | `get_profile` | read | 当前生效画像（洋葱模型，`SoulEngine.get_profile()` ⊕ 用户覆盖，markdown 渲染） |
 | `read_memory` | read | 记忆五层读取（core 摘要或 event/preference/awareness/insight/soul 原始 JSON，可截断） |
 | `search_history` | read | 历史对话（`chat_turns` 新增 `Database.search_chat_turns()`）+ 行为事件（`query_events`）关键词/时间范围检索 |
-| `get_recommendations` | read | 推荐池头部只读预览（`get_pool_candidates` / `get_pool_candidates_for_platform`），不消耗池、不标记已展示 |
-| `get_watch_history` | read | 本地内容历史（clicked/shown/removed 投影）与收藏/稍后再看清单，不触发真实抓取 |
+| `get_recommendations` | read | 推荐池头部只读预览（`get_pool_candidates` / `get_pool_candidates_for_platform`），返回内容身份与完整链接供保存使用，不消耗池、不标记已展示 |
+| `get_watch_history` | read | 本地内容历史（clicked/shown/removed 投影）与收藏/稍后再看清单，返回内容身份及实际推荐记录 ID（如有），不触发真实抓取 |
 | `query_discovery_pool` | read | discovery 候选池库存：可服务数、待处理数、有货平台、可选抽样 |
 | `get_config` | read | 配置只读，api_key/cookie/token/password 等键递归打码 |
-| `list_sources` | read | 订阅源列表（M1 已有） |
+| `list_sources` | read | 订阅源列表，含 ID、查询词/URL，支持区分同名订阅后精确开关 |
 | `write_memory` | soft_write | 写记忆到各层 `agent_notes` 命名空间（event/preference/awareness/insight），不覆盖引擎字段，soul 层禁写 |
 | `submit_feedback` | soft_write | 推荐反馈（like/dislike/dismiss/comment），复用 `POST /api/feedback` 同款 durable 事件流入（event_ingress 幂等 + 推荐行投影 + 轻量认知钩子） |
 | `save_item` | soft_write | 本地收藏/稍后再看（`SavedSyncService.save_local(auto_sync=False)`，不同步平台账号） |
 | `create_source` | hard_write | 创建订阅源（M1 已有） |
 | `toggle_source` | hard_write | 订阅源开关（M1 已有） |
-| `update_config` | hard_write | 配置修改（M7 起真写入）：白名单内已存在标量键（文本/数字/布尔），密钥类与路径/存储类一律拒绝；批准后经 `config_persist_hook` 落 config.toml（失败回滚）并触发 `config_reload_hook` 热重载 |
+| `update_config` | hard_write | 配置修改（M7 起真写入）：白名单内已存在标量键（文本/数字/布尔），密钥类与路径/存储类一律拒绝；批准后经 API `config_update_hook` 提交单字段补丁，复用设置页保存锁、应用队列与 last-good 回滚；实际热重载失败会返回失败并结束审批为 failed |
 
 上下文策略是「不塞数据，给入口」：工具按需查询系统数据，结果全部有
 长度上限（截断并标注）。
+
+内容读取工具在每条摘要后提供 JSON「定位信息」：`content_id` /
+`source_platform` / `content_url` / `content_type` / `title` / `author_name`
+保留原始身份和完整链接，供模型继续调用 `save_item`。历史投影中存在真实
+`recommendation_id` 时一并返回，供 `submit_feedback` 使用；未展示的推荐池
+候选不伪造推荐记录 ID，也不能把列表序号或缓存键用作反馈 ID。
 
 ### Skill 体系（M4）
 
@@ -252,12 +258,18 @@ tool_result / approval_request / step_limit_reached / final）以相同 dict 结
 `chat_turns.payload.agent_events`（JSON 数组，免迁移），历史回放直接读
 `GET /api/chat/turns/{turn_id}` 的 `payload.agent_events`。
 streaming turn 创建时服务端在 payload 写入 `agent_stream`（+ 可选 `agent_skill`）
-标记（属客户端不可伪造的保留键）：交互流断连后由 durable 兜底 worker
-完成的这类 turn 会**重跑同一多跳 loop**（同 skill、同工具子集）并把事件流
-落进 `agent_events`，回放行为与交互路径一致；agent loop 未接线的降级
-runtime 才退回 legacy 单跳回复。
+标记（属客户端不可伪造的保留键）：同进程交互流断连后，API 持有的执行任务
+继续运行原 loop，逐事件落 `agent_events` 并完成 turn。重复请求在对话租约内
+重新读取终态，直接重放已存事件和回复。尚未开始执行或进程重启留下的 pending
+turn 由 durable worker 使用原 skill 补答；进程崩溃仍遵循至少一次恢复语义，
+不能把网络断连的去重保证理解为跨崩溃的工具 exactly-once 保证。
+未知 turn 返回 404，消息、会话或 skill 冲突返回 409。
 
 ### L2 审批门（M7）
+
+系统管家在用户改动目标和参数明确后直接调用写工具生成审批卡；该调用只提交
+提案。用户在卡片上批准才触发执行，无须先在聊天中重复口头确认。回复中仅在
+取得真实审批 ID 后声称卡片已生成。
 
 hard_write 工具（create_source / toggle_source / update_config）在 agent loop
 里**绝不直接执行**：接线了 approval gate 的 `AgentLoop` 拦截这类调用，把
@@ -273,11 +285,17 @@ hard_write 工具（create_source / toggle_source / update_config）在 agent lo
 HTTP 请求内同步执行；前端轮询 `GET /api/chat/approvals` 观察
 `executing → executed / failed` 的进展。
 
+审批登记前先校验工具 JSON Schema；参数错误作为 `ok=false` 的工具结果
+回填模型修正，不生成注定执行失败的审批卡。
+
 **存储**：`ApprovalStore` 是单 JSON 文件存储（`{data_dir}/chat_approvals.json`，
 tmp + os.replace 原子写，进程内 threading.Lock 串行化），刻意不动
 `storage/database.py`（免迁移）；`path=None` 时为纯内存（测试）。生产接线
-（`api/runtime_context.py`）在热重载间**复用同一 store 实例**（ backing 文件
-路径相同即保留），保证状态机只有一份内存权威；读路径（get/list）只在惰性
+（`api/runtime_context.py`）在热重载间**复用同一 store 实例**：文件从
+`Config.data_path` 定位，按规范路径比较，项目相对路径和符号链接别名（例如
+macOS 的 `/tmp` 与 `/private/tmp`）指向同文件时仍保留实例，避免配置批准
+触发重建时误走崩溃恢复、把 `executing` 回退为 `approved`，保证状态机只有
+一份内存权威；读路径（get/list）只在惰性
 过期真的改变了记录时才落盘，避免热重载窗口内并存的旧实例把文件写回旧态。
 记录字段：approval_id（`ap_*`）/ tool_name / arguments / summary（做什么）/
 reason（为什么，取参数的 `reason`）/ impact（影响说明，来自 `Tool.impact_hint`）/
@@ -309,10 +327,12 @@ best-effort：台账写入失败不阻塞审批动作。
 true/false/1/0/yes/no/on/off）；键任一段命中密钥类标记（api_key / cookie /
 token / secret / password / credential / sessdata / access_key）或路径/存储类
 标记（dir / path / file / database 分词匹配，外加显式 `data_dir`）一律拒绝。
-写入顺序：改 live Config → `config_persist_hook` 落盘（失败即回滚内存值并抛错）
-→ `config_reload_hook` 触发热重载（生产接线 = app 层
-`_rebuild_runtime_with_lane_handoff`，经 `ctx.config_reload_delegate` 委托；
-未接线时结果文案注明重启后生效）。
+写入顺序：内存副本校验 → API `config_update_hook(key, value)` → 锁内加载最新磁盘配置并应用单字段补丁 → 快照/保存 → 同一 config apply queue → 等待实际生效或回滚。成功才更新 last-good；等待期间不改 live Config，失败/被较新修订替代均返回失败。脱离 API 的兼容调用仍使用 persist/reload hooks；reload 失败时补偿保存旧配置并尝试恢复旧运行时，保留原始错误。任一补偿失败会分别报告文件或运行时恢复失败，避免把部分写入当作已完整回滚。
+
+落盘前必须通过 `validate_runtime_config`，无效 provider 等配置不能破坏现有
+可用配置；校验失败与持久化失败均回滚原值。非有限数字（NaN/Infinity）和
+私有属性路径一律拒绝。白名单、字段与类型校验失败均返回 `ok=false`，使
+审批准确落到 `failed`，不会显示为已经执行成功。
 
 ### 任务中心（M6，durable 后台任务）
 
@@ -362,16 +382,22 @@ skill?)` 元工具（read 级、无副作用，注册进每个 skill 子集，�
   bypass_semaphore=True, approval_gate=chat_approval_store)`（M4 起从 M1 的源管理
   三工具升级为全量 v1 工具集；M7 起挂审批门），同时暴露
   `ctx.agent_tool_registry`（端点按 skill 做 `subset()`）、`ctx.agent_tool_context`
-  （M7：update_config 的 persist/reload hook 载体）、`ctx.chat_approval_store`
+  （M7：update_config 的统一 apply hook 与兼容 persist/reload hook 载体）、`ctx.chat_approval_store`
   （M7：`{data_dir}/chat_approvals.json`）与 `ctx.skill_catalog`
   （内置 + `data/skills/`），随热重载原子 swap；`ctx.config_reload_delegate`
   由 `create_app` 启动时一次性指向 `_rebuild_runtime_with_lane_handoff`，
   不随 rebuild 覆盖。
+- API 的 `_bind_runtime_lane_dependencies()` 在启动和热重载后把 app-owned
+  `EventIngressService` 接到当前 `agent_tool_context.event_ingress`，确保反馈工具
+  使用与 HTTP 反馈端点相同的持久化、幂等和认知唤醒入口；同时接入统一
+  `config_update_hook`，批准后的配置修改与设置页使用同一应用和回滚事务。
 - 端点在 `DialogueExecutionCoordinator` 租约内运行整个 loop（与旧单跳路径
   串行），历史与学习由 `SocraticDialogue.stream_agent_reply()` 在
   `_respond_lock` 下完成：user turn 先 append（失败回滚）、socratic system
   prompt 作为 loop 的 system instruction、完成后 append agent 答复并按
   learning mode 提交学习任务。
+- Agent 短期历史按 `session_id` 从 durable turns 恢复，长期画像和记忆共享；
+  canonical binding 同时进入模型 prompt、学习任务和回复后的对象结算。
 - `[agent] loop_enabled = false` 时端点返回 503；旧端点不受影响。
 
 ## 配置

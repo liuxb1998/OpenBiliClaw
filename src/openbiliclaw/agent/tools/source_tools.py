@@ -7,6 +7,7 @@ JSON Schema parameters and permission levels for the agent loop.
 
 from __future__ import annotations
 
+import json
 import logging
 import uuid
 from datetime import UTC, datetime
@@ -113,7 +114,7 @@ def _create_source(db: Any, args: dict[str, Any]) -> str:
     db.save_source_recipe(recipe)
 
     logger.info("Agent created source recipe: %s (%s)", name, recipe["id"])
-    return f"已创建内容源订阅「{name}」(类型: {source_type}, 策略: {strategy})"
+    return f"已创建内容源订阅「{name}」(类型: {source_type}, 策略: {strategy}, ID: {recipe['id']})"
 
 
 def _list_sources(db: Any, _args: dict[str, Any]) -> str:
@@ -124,7 +125,11 @@ def _list_sources(db: Any, _args: dict[str, Any]) -> str:
     lines = []
     for r in recipes:
         status = "✅" if r["enabled"] else "⏸️"
-        lines.append(f"{status} {r['name']} ({r['source_type']}/{r['strategy']})")
+        config = json.dumps(r.get("config") or {}, ensure_ascii=False, sort_keys=True)
+        lines.append(
+            f"{status} {r['name']} ({r['source_type']}/{r['strategy']})"
+            f" ID: {r['id']} 配置: {config}"
+        )
     return "当前内容源订阅：\n" + "\n".join(lines)
 
 

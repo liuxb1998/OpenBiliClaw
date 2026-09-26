@@ -19,6 +19,8 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from .tools.registry import validate_tool_arguments
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
 
@@ -259,6 +261,20 @@ class AgentLoop:
                     and tool.permission_level == "hard_write"
                     and self._approval_gate is not None
                 ):
+                    errors = validate_tool_arguments(tool.parameters, call.arguments)
+                    if errors:
+                        content = "参数校验失败: " + "；".join(errors)
+                        yield AgentEvent(
+                            type="tool_result",
+                            step=step,
+                            tool_name=call.name,
+                            text=content,
+                            ok=False,
+                        )
+                        messages.append(
+                            {"role": "tool", "tool_call_id": call.id, "content": content}
+                        )
+                        continue
                     content = ""
                     try:
                         record = self._approval_gate.submit(

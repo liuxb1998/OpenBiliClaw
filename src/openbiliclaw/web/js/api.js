@@ -480,7 +480,8 @@ async function postSse(path, body, { signal } = {}) {
 /**
  * Stream one multi-hop agent turn (POST /api/chat/agent/stream).
  * ``onEvent(eventName, data)`` receives every AgentEvent; resolves with the
- * terminal ``done`` payload (or ``null`` when the stream ended without one).
+ * terminal ``done`` payload. EOF before ``done`` rejects so an interrupted
+ * response cannot be mistaken for a durably completed turn.
  * Throws with ``err.status === 503`` when the loop is disabled so callers can
  * fall back to the legacy single-hop stream.
  */
@@ -513,6 +514,7 @@ export async function streamAgentChatTurn({
     }
     onEvent?.(name, data);
   }, watchdog);
+  if (!donePayload) throw new Error("对话连接已中断，等待历史恢复。");
   return donePayload;
 }
 

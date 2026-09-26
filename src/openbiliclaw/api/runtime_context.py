@@ -1878,13 +1878,16 @@ class RuntimeContext:
         # machine, so a rebuild mid-execution can never resurrect stale
         # states from a freshly reloaded copy (issue: approved/executing
         # records regressing after a hot reload).
-        approval_store_path = (
-            Path(str(getattr(new_config, "data_dir", "data") or "data")) / "chat_approvals.json"
-        )
+        # Runtime pinning normalizes data_dir during reload. Compare canonical
+        # paths so relative paths and symlink aliases (e.g. /tmp on macOS) keep
+        # the live authority instead of invoking crash recovery mid-execution.
+        approval_store_path = new_config.data_path.expanduser().resolve() / "chat_approvals.json"
         existing_approval_store = getattr(self, "chat_approval_store", None)
+        existing_approval_path = getattr(existing_approval_store, "path", None)
         if (
             existing_approval_store is not None
-            and getattr(existing_approval_store, "path", None) == approval_store_path
+            and existing_approval_path is not None
+            and Path(existing_approval_path).expanduser().resolve() == approval_store_path
         ):
             new_chat_approval_store = existing_approval_store
         else:

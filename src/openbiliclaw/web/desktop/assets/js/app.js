@@ -60,6 +60,7 @@
     let chatHistoryRefreshTimer = null;
     let chatHistoryRefreshInFlight = false;
     let lastDialogueChatSignature = null;
+    let dialogueChatRefreshGeneration = 0;
 
     const dialogueConfirmation = globalThis.OpenBiliClawDialogueConfirmation;
     if (!dialogueConfirmation) throw new Error("dialogue-confirmation shared helper did not load");
@@ -7446,6 +7447,7 @@ ${cardFeedbackBarHtml()}`;
 
     function renderChatLogElement(element, markup, { forceBottom = false } = {}) {
       if (!element) return;
+      const approvalDrafts = globalThis.OpenBiliClawAgentChat?.captureApprovalDrafts(element);
       const hadContent = element.childElementCount > 0;
       const shouldStickToBottom = forceBottom || !hadContent || isNearScrollBottom(element);
       const previousScrollTop = element.scrollTop;
@@ -7457,6 +7459,7 @@ ${cardFeedbackBarHtml()}`;
       );
 
       element.innerHTML = markup;
+      globalThis.OpenBiliClawAgentChat?.restoreApprovalDrafts(element, approvalDrafts);
 
       for (const details of element.querySelectorAll(".dialogue-evidence")) {
         const turnId = details.closest("[data-dialogue-turn-id]")?.dataset.dialogueTurnId || "";
@@ -7531,10 +7534,13 @@ ${cardFeedbackBarHtml()}`;
       // M8：agent 模式按当前会话实体拉取（含 payload.agent_events 回放数据）；
       // legacy 模式保持旧的共享 session 通道。
       if (agentChatEnabled()) {
+        const sessionId = state.agentChat.sessionId || "default";
+        const generation = ++dialogueChatRefreshGeneration;
         const detail = await requestJsonStrict(
-          `${ENDPOINTS.chatSessions}/${encodeURIComponent(state.agentChat.sessionId || "default")}?limit=100`,
+          `${ENDPOINTS.chatSessions}/${encodeURIComponent(sessionId)}?limit=100`,
           { cache: "no-store" }
         );
+        if (generation !== dialogueChatRefreshGeneration || sessionId !== (state.agentChat.sessionId || "default")) return;
         applyDialogueChatSnapshot(detail?.items || []);
         return;
       }
@@ -7995,6 +8001,7 @@ ${cardFeedbackBarHtml()}`;
     function liveAgentChatMarkup() {
       const live = state.agentChat.live;
       if (!live || !chatAgentCore) return "";
+      if (live.sessionId !== (state.agentChat.sessionId || "default")) return "";
       const parts = [];
       const hasProcess = live.process.steps.length || live.process.stepLimitText || live.process.errorText;
       if (hasProcess) {
@@ -8030,7 +8037,8 @@ ${cardFeedbackBarHtml()}`;
       if (!chatAgentCore) return;
       if (name === "done") {
         live.replyText = String(data?.reply || live.process.finalText || live.replyText || "");
-        if (data?.skill && String(data.skill) !== state.agentChat.skill) {
+        if (data?.skill && live.sessionId === state.agentChat.sessionId &&
+          state.agentChat.skill === live.skill && String(data.skill) !== state.agentChat.skill) {
           state.agentChat.skill = String(data.skill);
           persistAgentChatPrefs();
         }
@@ -8089,6 +8097,7 @@ ${cardFeedbackBarHtml()}`;
         watchdog?.cancel();
       }
       parser.end();
+      if (!live.finished) throw new Error("对话连接已中断，等待历史恢复。");
     }
 
     // 旧假流式端点回退（agent loop 被 `[agent] loop_enabled=false` 关掉时）。
@@ -8156,6 +8165,7 @@ ${cardFeedbackBarHtml()}`;
           body: JSON.stringify(payload),
         });
       } catch (error) {
+        if (sessionId !== (agentState.sessionId || "default")) return;
         retainedChatDraft = message;
         const input = $("#chatInput");
         if (input) input.value = message;
@@ -8165,6 +8175,7 @@ ${cardFeedbackBarHtml()}`;
         return;
       }
       if (!turn?.turn_id) {
+        if (sessionId !== (agentState.sessionId || "default")) return;
         state.chat.push({ role: "agent", text: "当前没有连上后端，聊天没有提交成功。请检查 FastAPI 地址后重试。" });
         renderChat();
         showToast("聊天提交失败：后端不可用");
@@ -8175,11 +8186,13 @@ ${cardFeedbackBarHtml()}`;
         replyText: "",
         finished: false,
         turnId: turn.turn_id,
+        sessionId,
+        skill,
       };
-      agentState.live = live;
+      if (sessionId === (agentState.sessionId || "default")) agentState.live = live;
       renderChat({ forceBottom: true });
       const finalize = async () => {
-        agentState.live = null;
+        if (agentState.live === live) agentState.live = null;
         lastDialogueChatSignature = null;
         await refreshDialogueTurns().catch(() => {});
         await refreshDesktopPendingConfirmations().catch(() => {});
@@ -8194,20 +8207,24 @@ ${cardFeedbackBarHtml()}`;
       } catch (error) {
         if (Number(error?.status) === 503) {
           // loop_enabled=false：这一轮回退到旧假流式端点，会话/历史功能不变。
-          agentState.live = null;
+          if (agentState.live === live) agentState.live = null;
           showToast("Agent 对话未在后端启用，本轮已回退到普通对话模式");
           try {
-            await legacyStreamForTurn(turn, message);
+            if (sessionId === (agentState.sessionId || "default")) await legacyStreamForTurn(turn, message);
           } catch {
-            state.chat.push({ role: "agent", text: "聊天已提交，但流式连接中断，稍后会从历史自动恢复。" });
-            renderChat();
+            if (sessionId === (agentState.sessionId || "default")) {
+              state.chat.push({ role: "agent", text: "聊天已提交，但流式连接中断，稍后会从历史自动恢复。" });
+              renderChat();
+            }
           }
           await finalize();
           return;
         }
-        agentState.live = null;
-        state.chat.push({ role: "agent", text: "聊天已提交，但流式连接中断，稍后会从历史自动恢复。" });
-        renderChat();
+        if (agentState.live === live) agentState.live = null;
+        if (sessionId === (agentState.sessionId || "default")) {
+          state.chat.push({ role: "agent", text: "聊天已提交，但流式连接中断，稍后会从历史自动恢复。" });
+          renderChat();
+        }
         await finalize();
       }
     }
@@ -8275,10 +8292,12 @@ ${cardFeedbackBarHtml()}`;
     function renderChatApprovalsPanel() {
       const body = $("#chatApprovalsBody");
       if (!body || !chatAgentCore) return;
+      const approvalDrafts = globalThis.OpenBiliClawAgentChat?.captureApprovalDrafts(body);
       body.innerHTML = chatAgentCore.approvalsPanelMarkup([
         ...state.agentChat.approvals,
         ...approvalExecutingOverrides.values(),
       ]);
+      globalThis.OpenBiliClawAgentChat?.restoreApprovalDrafts(body, approvalDrafts);
     }
 
     function renderChatApprovalsPanelVisibility() {

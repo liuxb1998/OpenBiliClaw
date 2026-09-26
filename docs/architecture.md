@@ -102,10 +102,11 @@ dialogue entries → app-stable execution lease(max active 1; reload pause/drain
                    → visible completion CAS; transient/cancel → pending + bounded in-place retry
                    explicit invalid → failed CAS
   direct chat/probes → same lease through response + ctx-dependent side effects
-  chat agent loop (「聊一聊」) → POST /api/chat/agent/stream → same dialogue lease
-                 → AgentLoop(caller=agent.chat, interactive lane) multi-hop tool calling
-                 → SSE thinking/tool_call/tool_result/approval_request/final → payload.agent_events replay
-                 → hard_write call → ApprovalStore pending card → approve endpoint queues background execution (chat_approval_execute) + ledger audit
+  chat agent loop (「聊一聊」) → POST /api/chat/agent/stream → API-owned durable producer
+                 → same dialogue lease + terminal-state recheck → session-local context + AgentLoop
+                 → append payload.agent_events → SSE subscriber (disconnect keeps producer running)
+                 → completion CAS + learning/effects; repeated turn → persisted event replay
+                 → hard_write call → ApprovalStore pending card → approve endpoint queues background execution + config_update_hook → settings apply queue / last-good + ledger audit
                  → start_background_task confirm → POST /api/chat/tasks
                  → read-only AgentLoop(caller=agent.task, interactive lane) → steps → agent_tasks
                  → terminal report → agent_task_summary durable turn in source session
@@ -227,6 +228,10 @@ tag-owned 节点；`GET /api/config` 只投影 staged 布尔值和安全运行�
 - [Discovery 模块架构图](diagrams/discovery-architecture.html)
 
 ## 模块职责
+
+### Durable agent stream ownership (`api/` / `soul/`)
+
+`POST /api/chat/agent/stream` 的 durable producer 由 API application 持有，与 HTTP SSE 订阅的生命周期分离。浏览器断连后原 loop 继续，逐事件落库并完成回复；同一 turn 的重试在稳定对话 lease 内检查终态，只重放已存过程和回复。应用关闭会取消 producer，剩余 pending 由启动恢复处理。模型短期上下文按 `session_id` 装载，长期画像仍共享；canonical reply binding 同时进入 prompt 与学习任务。
 
 ### Agent Orchestrator (`agent/`)
 - 任务调度和策略决策

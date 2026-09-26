@@ -148,6 +148,7 @@ class SocraticDialogue:
         self._llm_service = llm_service
         self._session = session
         self._history: list[DialogueTurn] = []
+        self._agent_session_histories: dict[str, list[DialogueTurn]] = {}
         default_timezone = datetime.now().astimezone().tzinfo
         self._local_timezone = local_timezone or default_timezone or UTC
         self._now_provider = now_provider or (lambda: datetime.now().astimezone())
@@ -347,16 +348,19 @@ class SocraticDialogue:
         skill: SkillDefinition | None = None,
         tools: ToolRegistry | None = None,
         skill_switch_guide: str = "",
+        dialogue_binding: DialogueTurnBinding | Mapping[str, object] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run the multi-hop agent loop for one chat turn, streaming events.
 
-        Shares the legacy single-hop path's history, persona prompt and
-        post-reply learning: the user turn is appended before the loop runs
+        Shares the legacy single-hop path's persona and post-reply learning,
+        with conversation-local history when ``session_id`` is supplied.
+        The user turn is appended before the loop runs
         (rolled back on failure), the socratic system prompt becomes the
         loop's system instruction, and the completed exchange is recorded
         and queued for learning exactly like ``respond``. The dialogue lock
-        is held for the whole run so the shared history stays serialized
-        with the legacy path.
+        is held for the whole run so learning stays serialized with the
+        legacy path. ``dialogue_binding`` preserves the canonical reply
+        target in both the model prompt and the queued learning job.
 
         With ``skill`` (M4), the skill's persona prompt and the
         ``skill_switch_guide`` block are layered on top of the base socratic
@@ -373,25 +377,37 @@ class SocraticDialogue:
             )
 
         from openbiliclaw.llm.prompts import build_socratic_dialogue_prompt
+        from openbiliclaw.soul.dialogue_turn_context import DialogueTurnBinding
+
+        binding = (
+            DialogueTurnBinding.from_mapping(dialogue_binding)
+            if isinstance(dialogue_binding, Mapping)
+            else dialogue_binding
+        )
 
         async with self._respond_lock:
-            self._ensure_history_loaded()
-            history_length = len(self._history)
-            self._history.append(
+            history = self._agent_history(session_id, refresh_durable=bool(turn_id))
+            history_length = len(history)
+            history.append(
                 DialogueTurn(
                     role="user", content=user_message, timestamp=self._local_now().isoformat()
                 )
             )
             try:
                 service = self._llm_service or self._build_service()
-                prompt_user_message = self._user_prompt_with_current_time(user_message)
+                prompt_message = (
+                    binding.render_user_prompt(user_message)
+                    if binding is not None
+                    else user_message
+                )
+                prompt_user_message = self._user_prompt_with_current_time(prompt_message)
                 tone_profile = None
                 build_tone = getattr(service, "_build_dialogue_tone_profile", None)
                 if callable(build_tone):
                     tone_profile = build_tone()
                 prompt_messages = build_socratic_dialogue_prompt(
                     user_message=prompt_user_message,
-                    history=self._history_to_messages(),
+                    history=self._history_to_messages(history),
                     core_memory_text="",
                     tone_profile=tone_profile,
                     reply_style=str(getattr(service, "reply_style", "") or ""),
@@ -411,7 +427,7 @@ class SocraticDialogue:
                 async for event in agent_loop.run(
                     system_instruction=system,
                     user_message=prompt_user_message,
-                    history=self._history_to_messages(),
+                    history=self._history_to_messages(history),
                     tools=tools,
                     approval_context={
                         "session": session.strip() or self._session,
@@ -427,26 +443,27 @@ class SocraticDialogue:
 
                     raise LLMResponseContentError("LLM returned an empty response")
             except BaseException:
-                del self._history[history_length:]
+                del history[history_length:]
                 logger.exception("Failed to generate agent dialogue response.")
                 raise
 
-            self._history.append(
+            history.append(
                 DialogueTurn(
                     role="agent",
                     content=reply,
                     timestamp=self._local_now().isoformat(),
                 )
             )
-            self._queue_dialogue_learning(
-                {
-                    "user_message": user_message,
-                    "assistant_reply": reply,
-                    "session": session.strip() or self._session,
-                    "scope": scope,
-                    "turn_id": turn_id,
-                }
-            )
+            payload: dict[str, object] = {
+                "user_message": user_message,
+                "assistant_reply": reply,
+                "session": session.strip() or self._session,
+                "scope": scope,
+                "turn_id": turn_id,
+            }
+            if binding is not None:
+                payload["dialogue_binding"] = binding.to_mapping()
+            self._queue_dialogue_learning(payload, binding=binding)
 
     async def _respond_with_tools(
         self, service: Any, user_message: str, progress: Any = None
@@ -539,6 +556,30 @@ class SocraticDialogue:
     def clear_history(self) -> None:
         """Clear the dialogue history."""
         self._history.clear()
+        self._agent_session_histories.clear()
+
+    def _agent_history(
+        self, session_id: str, *, refresh_durable: bool = False
+    ) -> list[DialogueTurn]:
+        """Use conversation-local history while the long-term memory stays shared."""
+        normalized = session_id.strip()
+        if not normalized:
+            self._ensure_history_loaded()
+            return self._history
+        lister = getattr(self._database, "list_chat_turns_by_session", None)
+        if normalized in self._agent_session_histories and not (
+            refresh_durable and callable(lister)
+        ):
+            return self._agent_session_histories[normalized]
+        history: list[DialogueTurn] = []
+        if callable(lister):
+            try:
+                rows, _total = lister(session_id=normalized, limit=DIALOGUE_WINDOW_TURNS)
+                self._append_durable_history(history, rows)
+            except Exception:
+                logger.debug("Failed to load agent conversation history", exc_info=True)
+        self._agent_session_histories[normalized] = history
+        return history
 
     def _ensure_history_loaded(self) -> None:
         """Regurgitate the one durable cognition history across UI sessions."""
@@ -562,6 +603,11 @@ class SocraticDialogue:
         except Exception:
             logger.debug("Failed to regurgitate durable chat history", exc_info=True)
             return
+        self._append_durable_history(self._history, rows)
+
+    @staticmethod
+    def _append_durable_history(history: list[DialogueTurn], rows: Any) -> None:
+        """Render completed exchanges and system cards from durable rows."""
         for row in rows:
             if str(row.get("status", "")) != "completed":
                 continue
@@ -570,7 +616,7 @@ class SocraticDialogue:
             if scope == "hypothesis" and isinstance(payload, dict):
                 title = str(payload.get("title", "") or row.get("subject_title", "")).strip()
                 if title:
-                    self._history.append(
+                    history.append(
                         DialogueTurn(
                             role="agent",
                             content=title,
@@ -585,7 +631,7 @@ class SocraticDialogue:
             ):
                 question = str(row.get("reply", "")).strip()
                 if question:
-                    self._history.append(
+                    history.append(
                         DialogueTurn(
                             role="agent",
                             content=question,
@@ -598,7 +644,7 @@ class SocraticDialogue:
             if not message or not reply:
                 continue
             timestamp = str(row.get("created_at", "") or "")
-            self._history.append(
+            history.append(
                 DialogueTurn(
                     role="user",
                     content=message,
@@ -606,9 +652,11 @@ class SocraticDialogue:
                     relation_prefix=_relation_prefix_from_payload(payload),
                 )
             )
-            self._history.append(DialogueTurn(role="agent", content=reply, timestamp=timestamp))
+            history.append(DialogueTurn(role="agent", content=reply, timestamp=timestamp))
 
-    def _history_to_messages(self) -> list[dict[str, str]]:
+    def _history_to_messages(
+        self, history: list[DialogueTurn] | None = None
+    ) -> list[dict[str, str]]:
         """Convert prior dialogue turns to chat messages for the LLM.
 
         Truncated to the last ``DIALOGUE_WINDOW_TURNS`` exchanges (each ≈ a
@@ -616,7 +664,7 @@ class SocraticDialogue:
         window are unaffected — the returned bytes match the pre-window
         baseline, keeping provider prompt cache warm for short chats.
         """
-        prior = self._history[:-1]
+        prior = (self._history if history is None else history)[:-1]
         window_messages = DIALOGUE_WINDOW_TURNS * 2
         if len(prior) > window_messages:
             prior = prior[-window_messages:]
