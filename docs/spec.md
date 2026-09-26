@@ -359,7 +359,8 @@ dialogue entries → app-stable execution lease(max active 1; reload pause/drain
                    transient/cancel → pending + bounded in-place retry; explicit invalid → failed CAS
   direct chat/probes → same lease through response + ctx-dependent side effects
   chat agent loop (「聊一聊」) → POST /api/chat/agent/stream → API-owned durable producer
-                 → same dialogue lease + terminal-state recheck → session-local context + AgentLoop
+                 → session metadata.persona → turn-frozen agent_persona (expression only)
+                 → same dialogue lease + terminal-state recheck → session-local context + skill tools + persona + AgentLoop
                  → append payload.agent_events → SSE subscriber (disconnect keeps producer running)
                  → completion CAS + learning/effects; repeated turn → persisted event replay
                  → hard_write call → ApprovalStore pending card → approve endpoint re-dispatch → config_update_hook → settings apply queue / last-good + ledger audit

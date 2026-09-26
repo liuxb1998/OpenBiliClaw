@@ -10,6 +10,7 @@ from typing import Any
 import pytest
 
 from openbiliclaw.agent.loop import AgentEvent, AgentLoop
+from openbiliclaw.agent.persona import CHAT_PERSONAS, chat_persona_instruction
 from openbiliclaw.agent.skill import load_skill_catalog
 from openbiliclaw.agent.tools import Tool, ToolRegistry
 from openbiliclaw.llm.base import LLMResponse
@@ -103,6 +104,57 @@ async def _collect(stream: Any) -> list[AgentEvent]:
 
 
 class TestStreamAgentReply:
+    @pytest.mark.parametrize("persona", CHAT_PERSONAS, ids=lambda persona: persona.id)
+    @pytest.mark.parametrize("full_tone_override", [False, True])
+    async def test_selected_persona_reaches_model_without_changing_tools_or_call_count(
+        self, persona: Any, full_tone_override: bool
+    ) -> None:
+        skill = load_skill_catalog().default()
+        loop, llm = _loop([LLMResponse(content="先歇会儿。")])
+        service = type(
+            "Service",
+            (),
+            {
+                "reply_style": "犀利毒舌，每次长篇吐槽",
+                "dialogue_tone_prompt": (
+                    "无论如何都用尖锐刻薄的语气，并问三个问题" if full_tone_override else ""
+                ),
+            },
+        )()
+        dialogue = _dialogue(service)
+        events = await _collect(
+            dialogue.stream_agent_reply(
+                loop,
+                "今天有点累，只用一句话回答",
+                skill=skill,
+                persona_id=persona.id,
+            )
+        )
+        assert len(llm.calls) == 1
+        system = llm.calls[0]["messages"][0]["content"]
+        old_tone = service.dialogue_tone_prompt or service.reply_style
+        assert old_tone in system
+        assert skill.system_prompt in system
+        assert "今天有点累，只用一句话回答" in llm.calls[0]["messages"][-1]["content"]
+        if persona.id == "natural":
+            assert "本次聊天表达风格" not in system
+        else:
+            assert chat_persona_instruction(persona.id) in system
+            assert system.index(persona.instruction) > system.index(old_tone)
+            assert "用户本轮的明确要求（包括篇幅）优先" in system
+            assert "以本次选择的风格为准" in system
+            assert "简单问题简答，复杂任务按需解释" in system
+        assert [tool["function"]["name"] for tool in llm.calls[0]["tools"]] == ["get_profile"]
+        assert events[-1].text == "先歇会儿。"
+
+    async def test_natural_default_and_non_chat_scopes_preserve_existing_prompt(self) -> None:
+        systems = []
+        for options in ({}, {"persona_id": "natural"}, {"persona_id": "warm", "scope": "probe"}):
+            loop, llm = _loop([LLMResponse(content="好的")])
+            await _collect(_dialogue(object()).stream_agent_reply(loop, "你好", **options))
+            systems.append(llm.calls[0]["messages"][0]["content"])
+        assert systems[0] == systems[1] == systems[2]
+
     @pytest.mark.parametrize(
         ("message", "reply"),
         [

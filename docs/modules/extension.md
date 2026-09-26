@@ -21,6 +21,7 @@
 |------|------|------|
 | 聊一聊会话隔离与流结束校验 | ✅ | popup / 移动 Web 仅在 `done` 后确认流完成；迟到历史与消息按会话隔离，恢复沿用原 turn 的角色；popup 网络断连保持 agent 轮询，仅明确 503 降级旧聊天 |
 | 审批拒绝输入保留 | ✅ | popup / 移动 Web / 桌面共用审批草稿保留助手，周期刷新和流式重绘保留已展开拒绝表单、原因与焦点，终态更新立即移除操作；原因只读取对应 input，避免同名说明元素遮蔽 |
+| 移动/插件聊天风格 | ✅ | 六种独立于角色的风格模板，含说明与回复示例；通过会话 PATCH 保存，详情轮询恢复跨设备选择；保存等待/失败、切会话与旧 GET/PATCH 竞态有独立处理 |
 | 移动聊天即时反馈与键盘布局 | ✅ | 发送立即显示用户气泡和等待态，完成即显示回复而不等待历史刷新；重绘保留输入节点、选区和多行高度，完成回复不打断阅读旧消息；键盘可视区收缩时折叠外层导航，保留对话、输入和待审批入口；320px 窄屏顶部连接状态保持单行 |
 | 统一品牌图标 | ✅ | Chrome / Edge / Brave / Firefox manifest 使用 16 / 32 / 48 / 128px 精确尺寸图标，side panel 顶部品牌标记、普通透明 PWA 图标、专用不透明 `maskable` / Apple 主屏幕图标、32px 根 favicon、首次设置页、桌面 Web、移动 Web 和 GitHub Pages 官网统一从 `assets/brand/openbiliclaw-icon.png` 派生。源图的半透明边缘已去除旧白底消光色；扩展图标、favicon 与 maskable 图标使用满幅品牌粉底，页面头图容器也用品牌粉承接透明圆角。旧字母 `B`、CSS 圆环和官网重复的内联 SVG favicon 已移除；社交分享图、Chrome Web Store 素材与 README / 官网截图通过 `build_social_preview_assets.py`、`capture_chrome_webstore_ui.py --refresh-docs` 和既有构建脚本确定性重建。 |
 | 8.1 行为采集 | ✅ | `content/kernel.ts` + `shared/platforms/*` + `service-worker.ts` 已接通统一事件链；B 站 / 小红书 / 抖音 / YouTube / X / 知乎 / Linux.do 都通过 `PlatformAdapter` 产出同一 `BehaviorEvent` 形态，平台差异只保留在 selector、内容 ID 和 action 识别中；Reddit 与 Linux.do 另有只读插件任务源；click 监听在 capture 阶段执行，scroll 同时覆盖页面和内部滚动容器 |
@@ -224,6 +225,16 @@ extension/
 ```
 
 ## 当前能力
+
+### 聊天风格选择
+
+移动 Web 在现有角色入口中显示当前角色与风格，选择面板分“聊天风格 / 功能角色”，
+保留 320px 的可用空间，模板卡片自然行高并在面板内滚动；插件有独立风格按钮和
+不透明背景的原生 dialog。两端读取
+`GET /api/chat/personas` 的六个模板和同题示例，通过
+`PATCH /api/chat/sessions/{id} {persona}` 写入 `metadata.persona`。不额外写 localStorage
+或全局配置。选择成功从新消息生效；保存等待期间避免抢先发送，失联提示未确认保存，
+切会话后的晚返回只更新来源会话。目录加载失败可重试，不影响原有聊天。
 
 ### 聊一聊会话隔离与断线恢复
 

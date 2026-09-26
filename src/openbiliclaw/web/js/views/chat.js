@@ -14,6 +14,7 @@ import {
   createChatSession,
   updateChatSession,
   fetchChatSkills,
+  fetchChatPersonas,
   streamAgentChatTurn,
   streamChatTurnLegacy,
   fetchChatApprovals,
@@ -190,6 +191,14 @@ let sessionSkillMap = (() => {
 })();
 let chatSkills = [];
 let skillsSheetOpen = false;
+let chatPreferenceTab = "persona";
+let chatPersonas = [];
+let chatPersonaExamplePrompt = "";
+let personaCatalogLoading = false;
+let personaCatalogError = "";
+let personaRevision = 0;
+const personaSaveRequests = new Map();
+const personaSaveErrors = new Map();
 let pendingApprovals = [];
 let approvalsExpanded = false;
 // 异步审批执行（approve 只入队）：本页批准、等待终态的审批（id → turnId），
@@ -417,12 +426,17 @@ function createChatTopbar() {
   const skillBtn = document.createElement("button");
   skillBtn.type = "button";
   skillBtn.className = "chat-agent-skill-chip";
-  skillBtn.setAttribute("aria-label", "选择对话角色");
+  skillBtn.setAttribute("aria-label", "选择角色与聊天风格");
   const skillName = currentSkillName();
-  skillBtn.textContent = `🎭 ${skillDisplayTitle(skillName, chatSkills)}`;
+  skillBtn.innerHTML = `<span>🎭 ${esc(skillDisplayTitle(skillName, chatSkills))}</span>
+    <span class="chat-agent-persona-label">${esc(currentPersonaTitle())}</span>`;
   skillBtn.addEventListener("click", () => {
     skillsSheetOpen = !skillsSheetOpen;
-    if (skillsSheetOpen) void refreshSkills();
+    if (skillsSheetOpen) {
+      void refreshSkills();
+      void refreshPersonas();
+      void loadHistory();
+    }
     renderAgentOverlays();
   });
 
@@ -724,6 +738,118 @@ async function handleTaskCancel(button) {
 }
 
 // ── Agent data loading ───────────────────────────────────────
+function currentPersonaId() {
+  const session = chatSessions.find((item) => item?.session_id === activeSessionId);
+  return session ? String(session.metadata?.persona || "natural") : "";
+}
+
+function currentPersonaTitle() {
+  const id = currentPersonaId();
+  if (!id) return "风格加载中…";
+  return chatPersonas.find((persona) => persona.id === id)?.title
+    || (id === "natural" ? "自然朋友" : "已保存的风格");
+}
+
+function personaRequestError(error) {
+  const detail = error?.details?.detail;
+  const message = typeof detail === "string" ? detail : detail?.message || error?.details?.message;
+  if (message) return String(message).replace(/[。！!]+$/, "");
+  if (/[\u3400-\u9fff]/.test(error?.message || "")) return error.message.replace(/[。！!]+$/, "");
+  if (error?.name === "AbortError" || /timed?\s*out/i.test(error?.message || "")) return "请求超时";
+  if (Number(error?.status) === 401) return "登录已过期";
+  if ([404, 405].includes(Number(error?.status))) return "当前服务尚不支持聊天风格";
+  return error?.status ? `服务暂不可用（${error.status}）` : "连接中断或服务器未响应";
+}
+
+// Keep the server session as the only persona source. A read started before
+// a save, or answered while that save is pending, cannot roll back its choice.
+function mergeChatSessionSnapshot(session, requestRevision = personaRevision) {
+  const previous = chatSessions.find((item) => item?.session_id === session?.session_id);
+  if (requestRevision === personaRevision && !personaSaveRequests.has(session?.session_id)) {
+    return session;
+  }
+  const metadata = { ...session.metadata };
+  if (previous?.metadata?.persona) metadata.persona = previous.metadata.persona;
+  else delete metadata.persona;
+  return { ...session, metadata };
+}
+
+function applyChatSessionSnapshot(session) {
+  if (!session?.session_id) return false;
+  const previous = chatSessions.find((item) => item?.session_id === session.session_id);
+  const next = mergeChatSessionSnapshot(session);
+  chatSessions = previous
+    ? chatSessions.map((item) => item.session_id === session.session_id ? next : item)
+    : [...chatSessions, next];
+  if (previous?.metadata?.persona !== next.metadata?.persona) personaSaveErrors.delete(session.session_id);
+  return previous?.metadata?.persona !== next.metadata?.persona || previous?.title !== next.title;
+}
+
+async function refreshPersonas() {
+  if (personaCatalogLoading) return;
+  if (!state.online) {
+    personaCatalogError = "当前离线，恢复连接后可重新加载。";
+    if (skillsSheetOpen) renderAgentOverlays();
+    return;
+  }
+  personaCatalogLoading = true;
+  personaCatalogError = "";
+  if (skillsSheetOpen) renderAgentOverlays();
+  try {
+    const catalog = await fetchChatPersonas();
+    chatPersonas = catalog.personas;
+    chatPersonaExamplePrompt = catalog.examplePrompt;
+    if (!chatPersonas.length) throw new Error("聊天风格暂不可用，请稍后重试。");
+  } catch (error) {
+    personaCatalogError = personaRequestError(error);
+  } finally {
+    personaCatalogLoading = false;
+    if (skillsSheetOpen) renderAgentOverlays();
+  }
+}
+
+function invalidatePersonaReads(sessionId) {
+  personaRevision += 1;
+  if (sessionId === activeSessionId) {
+    historyRefreshGeneration += 1;
+    historyRefreshInFlight = false;
+  }
+}
+
+async function saveChatPersona(personaId) {
+  const sessionId = activeSessionId;
+  if (!chatPersonas.some((persona) => persona.id === personaId)
+    || !currentPersonaId() || personaSaveRequests.has(sessionId)) return;
+  if (personaId === currentPersonaId()) {
+    closeChatPreferences();
+    return;
+  }
+  personaSaveRequests.set(sessionId, personaId);
+  personaSaveErrors.delete(sessionId);
+  invalidatePersonaReads(sessionId);
+  renderAgentOverlays();
+  try {
+    const session = await updateChatSession(sessionId, { persona: personaId });
+    if (session?.session_id !== sessionId || session.metadata?.persona !== personaId) {
+      throw new Error("服务端未确认聊天风格，请重试。");
+    }
+    personaSaveRequests.delete(sessionId);
+    invalidatePersonaReads(sessionId);
+    applyChatSessionSnapshot(session);
+    if (sessionId !== activeSessionId) return;
+    render();
+    closeChatPreferences();
+    setDialogueStatus(`本会话已切换为「${currentPersonaTitle()}」，从下一句开始生效。`, "success");
+  } catch (error) {
+    personaSaveRequests.delete(sessionId);
+    invalidatePersonaReads(sessionId);
+    personaSaveErrors.set(sessionId, personaRequestError(error));
+    if (sessionId !== activeSessionId) return;
+    renderAgentOverlays();
+    setDialogueStatus("未能确认聊天风格已保存，请重试。", "error");
+  }
+}
+
 async function refreshSkills() {
   if (!state.online) return;
   try {
@@ -736,12 +862,14 @@ async function refreshSkills() {
 
 async function refreshSessions() {
   if (!state.online) return;
+  const requestRevision = personaRevision;
   try {
-    chatSessions = await fetchChatSessions();
+    const sessions = await fetchChatSessions();
+    chatSessions = sessions.map((session) => mergeChatSessionSnapshot(session, requestRevision));
   } catch {
     // Keep the last list while offline.
   }
-  if (sessionsDrawerOpen) renderAgentOverlays();
+  if (sessionsDrawerOpen || skillsSheetOpen) renderAgentOverlays();
 }
 
 async function refreshApprovals() {
@@ -886,8 +1014,16 @@ function ensureAgentOverlayHost() {
   return host;
 }
 
+function closeChatPreferences() {
+  skillsSheetOpen = false;
+  renderAgentOverlays();
+  $root?.querySelector(".chat-agent-skill-chip")?.focus();
+}
+
 function renderAgentOverlays() {
   const host = ensureAgentOverlayHost();
+  const previousPreferenceFocus = host.querySelector(".agent-preferences-panel :focus");
+  const previousPreferenceScroll = host.querySelector(".agent-preferences-panel .agent-drawer-list")?.scrollTop || 0;
   host.innerHTML = "";
 
   if (sessionsDrawerOpen) {
@@ -959,13 +1095,38 @@ function renderAgentOverlays() {
     const sheet = document.createElement("div");
     sheet.className = "agent-drawer-overlay";
     const skillName = currentSkillName();
+    const personaId = currentPersonaId();
+    const savingPersona = personaSaveRequests.get(activeSessionId);
+    const personaError = personaSaveErrors.get(activeSessionId);
     sheet.innerHTML = `
-      <div class="agent-drawer" role="dialog" aria-modal="true" aria-label="选择对话角色">
+      <div class="agent-drawer agent-preferences-panel" role="dialog" aria-modal="true" aria-label="角色与聊天风格">
         <div class="agent-drawer-head">
-          <span class="agent-drawer-title">对话角色</span>
+          <span class="agent-drawer-title">角色与聊天风格</span>
           <button type="button" class="agent-drawer-close" data-sheet-close aria-label="关闭">✕</button>
         </div>
-        <div class="agent-drawer-list">
+        <div class="agent-preference-tabs" role="tablist" aria-label="设置类型">
+          <button type="button" id="chat-persona-tab" role="tab" aria-selected="${chatPreferenceTab === "persona"}" aria-controls="chat-persona-options" data-preference-tab="persona">聊天风格</button>
+          <button type="button" id="chat-skill-tab" role="tab" aria-selected="${chatPreferenceTab === "skill"}" aria-controls="chat-skill-options" data-preference-tab="skill">功能角色</button>
+        </div>
+        ${chatPreferenceTab === "persona" ? `
+        <div class="agent-drawer-list" id="chat-persona-options" role="tabpanel" aria-labelledby="chat-persona-tab" aria-busy="${Boolean(savingPersona)}">
+          <p class="agent-preference-hint">选择阿B说话的方式。保存后仅对本会话的下一句起生效，功能角色保持不变。</p>
+          ${chatPersonaExamplePrompt ? `<p class="agent-preference-hint">示例回应：${esc(chatPersonaExamplePrompt)}</p>` : ""}
+          ${savingPersona ? '<p class="agent-preference-status" role="status">正在保存聊天风格…</p>' : ""}
+          ${personaError ? `<p class="agent-preference-error" role="alert">尚未确认保存：${esc(personaError)}。请刷新或重试。</p>` : ""}
+          ${personaCatalogError ? `<p class="agent-preference-error" role="alert">聊天风格暂不可用：${esc(personaCatalogError)}</p><button type="button" class="agent-btn agent-btn-secondary agent-persona-retry" data-persona-retry>重新加载</button>` : ""}
+          ${!personaCatalogError && chatPersonas.length === 0 ? '<p class="agent-drawer-empty" role="status">聊天风格加载中…</p>' : ""}
+          ${!personaId && chatPersonas.length > 0 ? '<p class="agent-preference-hint" role="status">正在读取本会话的风格…</p>' : ""}
+          ${chatPersonas.map((persona) => `
+            <button type="button" class="agent-skill-row agent-persona-row${persona.id === personaId ? " is-active" : ""}" data-persona-pick="${esc(persona.id)}" aria-pressed="${persona.id === personaId}" ${savingPersona || !personaId || personaCatalogError ? "disabled" : ""}>
+              <span class="agent-skill-row-title">${esc(persona.title)}${persona.id === personaId ? " · 当前" : persona.default ? "（默认）" : ""}</span>
+              <span class="agent-skill-row-desc">${esc(persona.description || "")}</span>
+              <span class="agent-persona-example">例如：${esc(persona.example || "")}</span>
+            </button>
+          `).join("")}
+        </div>` : `
+        <div class="agent-drawer-list" id="chat-skill-options" role="tabpanel" aria-labelledby="chat-skill-tab">
+          <p class="agent-preference-hint">选择阿B能帮你做什么，聊天风格保持不变。</p>
           ${chatSkills.length === 0 ? '<p class="agent-drawer-empty">角色列表加载中…</p>' : ""}
           ${chatSkills.map((skill) => `
             <button type="button" class="agent-skill-row${skill.name === skillName || (!skillName && skill.isDefault) ? " is-active" : ""}" data-skill-pick="${esc(skill.name)}">
@@ -973,24 +1134,77 @@ function renderAgentOverlays() {
               <span class="agent-skill-row-desc">${esc(skill.description)}</span>
             </button>
           `).join("")}
-        </div>
+        </div>`}
       </div>`;
     sheet.addEventListener("click", (event) => {
       if (event.target === sheet || (event.target instanceof Element && event.target.closest("[data-sheet-close]"))) {
-        skillsSheetOpen = false;
+        closeChatPreferences();
+        return;
+      }
+      const target = event.target instanceof Element ? event.target : null;
+      const tab = target?.closest("[data-preference-tab]");
+      if (tab instanceof HTMLElement) {
+        chatPreferenceTab = tab.dataset.preferenceTab === "skill" ? "skill" : "persona";
         renderAgentOverlays();
+        host.querySelector(`[data-preference-tab="${chatPreferenceTab}"]`)?.focus();
+        return;
+      }
+      if (target?.closest("[data-persona-retry]")) {
+        void refreshPersonas();
+        return;
+      }
+      const personaPick = target?.closest("[data-persona-pick]");
+      if (personaPick instanceof HTMLElement) {
+        void saveChatPersona(personaPick.dataset.personaPick || "");
         return;
       }
       const pick = event.target instanceof Element ? event.target.closest("[data-skill-pick]") : null;
       if (pick instanceof HTMLElement) {
         setSessionSkill(activeSessionId, pick.dataset.skillPick || "");
-        skillsSheetOpen = false;
-        renderAgentOverlays();
         render();
+        closeChatPreferences();
         setDialogueStatus(`已切换到「${skillDisplayTitle(pick.dataset.skillPick || "", chatSkills)}」。`, "success");
       }
     });
+    sheet.addEventListener("keydown", (event) => {
+      if (event.key === "Escape") {
+        event.preventDefault();
+        closeChatPreferences();
+        return;
+      }
+      if (event.key === "Tab") {
+        const buttons = [...sheet.querySelectorAll("button:not(:disabled)")];
+        const first = buttons[0];
+        const last = buttons.at(-1);
+        if (event.shiftKey && document.activeElement === first) {
+          event.preventDefault();
+          last?.focus();
+        } else if (!event.shiftKey && document.activeElement === last) {
+          event.preventDefault();
+          first?.focus();
+        }
+        return;
+      }
+      const tab = event.target instanceof Element ? event.target.closest("[data-preference-tab]") : null;
+      if (!tab || !["ArrowLeft", "ArrowRight", "Home", "End"].includes(event.key)) return;
+      event.preventDefault();
+      chatPreferenceTab = event.key === "Home" ? "persona" : event.key === "End" ? "skill"
+        : chatPreferenceTab === "persona" ? "skill" : "persona";
+      renderAgentOverlays();
+      host.querySelector(`[data-preference-tab="${chatPreferenceTab}"]`)?.focus();
+    });
     host.appendChild(sheet);
+    // Refreshes can replace the sheet while the catalog or session arrives.
+    // Retain its focused control and reading position; first open enters the
+    // active tab so keyboard users stay inside the modal immediately.
+    const restoredFocus = previousPreferenceFocus && [...sheet.querySelectorAll("button:not(:disabled)")].find((button) =>
+      ["personaPick", "preferenceTab", "skillPick"].some((key) => previousPreferenceFocus.dataset[key]
+        && previousPreferenceFocus.dataset[key] === button.dataset[key])
+      || (previousPreferenceFocus.hasAttribute("data-sheet-close") && button.hasAttribute("data-sheet-close"))
+      || (previousPreferenceFocus.hasAttribute("data-persona-retry") && button.hasAttribute("data-persona-retry")));
+    (restoredFocus || sheet.querySelector(`[data-preference-tab="${chatPreferenceTab}"]`))?.focus({ preventScroll: true });
+    const list = sheet.querySelector(".agent-drawer-list");
+    if (list) list.scrollTop = previousPreferenceScroll;
   }
 
   if (tasksOverlayOpen) {
@@ -1889,6 +2103,10 @@ async function loadHistory() {
     let changed = false;
     if (historyResult.status === "fulfilled") {
       const data = historyResult.value;
+      if (data?.session && applyChatSessionSnapshot(data.session)) {
+        changed = true;
+        if (skillsSheetOpen) renderAgentOverlays();
+      }
       const nextTurns = Array.isArray(data?.items || data?.turns)
         ? (data.items || data.turns).map(normalizeChatTurn)
         : [];
@@ -2057,6 +2275,7 @@ export function initChatView(root) {
     loaded = true;
     loadNotifications();
     void refreshSkills().then(render);
+    void refreshPersonas().then(render);
     void refreshSessions().then(render);
     void refreshAgentTasks().then(render);
   }

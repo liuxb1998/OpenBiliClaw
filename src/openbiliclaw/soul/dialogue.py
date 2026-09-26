@@ -19,6 +19,8 @@ from datetime import UTC, datetime
 from enum import StrEnum
 from typing import TYPE_CHECKING, Any, cast
 
+from openbiliclaw.agent.persona import DEFAULT_CHAT_PERSONA, chat_persona_instruction
+
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Callable
     from datetime import tzinfo
@@ -349,6 +351,7 @@ class SocraticDialogue:
         skill: SkillDefinition | None = None,
         tools: ToolRegistry | None = None,
         skill_switch_guide: str = "",
+        persona_id: str = DEFAULT_CHAT_PERSONA,
         dialogue_binding: DialogueTurnBinding | Mapping[str, object] | None = None,
     ) -> AsyncIterator[AgentEvent]:
         """Run the multi-hop agent loop for one chat turn, streaming events.
@@ -372,6 +375,10 @@ class SocraticDialogue:
         M7: ``session`` / ``session_id`` / ``turn_id`` are forwarded as the
         loop's approval context so parked hard_write approvals can be traced
         back to the conversation that requested them.
+
+        ``persona_id`` is a server-frozen expression preference for chat only.
+        It changes no tools or learning ownership. Non-natural presets override
+        conflicting global expression rules; the current user's request wins.
         """
         if self._learning_mode is DialogueLearningMode.QUEUED and self._settlement_queue is None:
             raise DialogueLearningConfigurationError(
@@ -422,6 +429,11 @@ class SocraticDialogue:
                     system = _layer_skill_system_prompt(
                         system, skill, skill_switch_guide=skill_switch_guide
                     )
+                persona_instruction = (
+                    chat_persona_instruction(persona_id) if scope == "chat" else ""
+                )
+                if persona_instruction:
+                    system = f"{system}\n\n{persona_instruction}"
                 system = (
                     f"{system}\n\n{_AGENT_LOOP_GROUND_RULES}"
                     if system

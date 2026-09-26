@@ -91,6 +91,7 @@ test("popup history from a departed session is ignored", async () => {
     state: { online: true }, HTMLElement: Element,
     elements: { chatMessages: new Element() }, popupChatSessionId: "a",
     chatHistoryHydrationInFlight: false, chatHistoryHydrationGeneration: 0,
+    popupPersonaRevision: 0,
     isChatMessagesNearBottom: () => true,
     fetchChatSessionDetail: () => response.promise, selectDialogueTurns: value => value,
     chatHistorySignature: JSON.stringify, lastChatHistorySignature: null,

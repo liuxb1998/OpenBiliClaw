@@ -30,6 +30,7 @@
       chatAgentStream: "/chat/agent/stream",
       chatSessions: "/chat/sessions",
       chatSkills: "/chat/skills",
+      chatPersonas: "/chat/personas",
       chatTasks: "/chat/tasks",
       chatApprovals: "/chat/approvals",
       dialogueContexts: "/chat/contexts",
@@ -167,6 +168,14 @@
         skill: "",
         skills: [],
         skillPickerOpen: false,
+        personas: [],
+        personaCatalogLoading: false,
+        personaCatalogError: "",
+        personaExamplePrompt: "",
+        personaPickerOpen: false,
+        personaDraft: "",
+        personaSaves: new Map(),
+        personaStatusBySession: new Map(),
         sidebarOpen: true,
         live: null,
         tasksOpen: false,
@@ -7548,6 +7557,7 @@ ${cardFeedbackBarHtml()}`;
         `${ENDPOINTS.chatTurns}?session=${encodeURIComponent(SHARED_CHAT_SESSION)}&limit=100`,
         { cache: "no-store" }
       );
+      if (agentChatEnabled()) return;
       applyDialogueChatSnapshot(snapshot);
     }
 
@@ -7709,6 +7719,7 @@ ${cardFeedbackBarHtml()}`;
     const AGENT_CHAT_SESSION_KEY = "openbiliclaw.webui.chatSessionId";
     const AGENT_CHAT_SKILL_KEY = "openbiliclaw.webui.chatSkillBySession";
     let chatSessionsSignature = "";
+    let chatSessionsGeneration = 0;
     let chatApprovalsSignature = "";
     let chatTasksSignature = "";
     // 异步审批执行（approve 只入队）：本页批准、等待终态的审批 id，
@@ -7801,6 +7812,7 @@ ${cardFeedbackBarHtml()}`;
           ? String(session.title || (session.session_id === "default" ? "默认会话" : "未命名会话"))
           : "";
       }
+      renderChatPersonaState();
     }
 
     function renderChatBadges() {
@@ -7834,16 +7846,30 @@ ${cardFeedbackBarHtml()}`;
         return;
       }
       loadAgentChatPrefs();
+      // The startup snapshot belongs to the legacy shared channel, not to
+      // the restored agent conversation. Clear it before exposing its chrome.
+      state.chat = [];
+      lastDialogueChatSignature = null;
+      renderChat();
       applyAgentChatChrome();
+      void refreshChatPersonas();
       await Promise.allSettled([refreshChatSessions(), refreshChatApprovals(), refreshChatTasks()]);
       await refreshDialogueTurns().catch(() => {});
     }
 
     async function refreshChatSessions() {
+      const generation = ++chatSessionsGeneration;
       const query = state.agentChat.includeArchived ? "?include_archived=true" : "";
       const payload = await requestJsonStrict(`${ENDPOINTS.chatSessions}${query}`, { cache: "no-store" });
+      if (generation !== chatSessionsGeneration) return;
       const sessions = asArray(payload?.items);
       const signature = JSON.stringify(sessions) + `|${state.agentChat.sessionId}|${state.agentChat.includeArchived}`;
+      for (const session of sessions) {
+        const previous = state.agentChat.sessions.find((item) => item?.session_id === session.session_id);
+        if (previous && previous.metadata?.persona !== session.metadata?.persona && !state.agentChat.personaSaves.has(session.session_id)) {
+          state.agentChat.personaStatusBySession.delete(session.session_id);
+        }
+      }
       state.agentChat.sessions = sessions;
       // 会话不存在（例如被另一端归档清理后）时回落默认会话。
       if (
@@ -7852,6 +7878,7 @@ ${cardFeedbackBarHtml()}`;
         !sessions.some((item) => item?.session_id === state.agentChat.sessionId)
       ) {
         state.agentChat.sessionId = "default";
+        toggleChatPersonaPicker(false);
         persistAgentChatPrefs();
       }
       if (signature !== chatSessionsSignature) {
@@ -7864,6 +7891,7 @@ ${cardFeedbackBarHtml()}`;
     async function selectChatSession(sessionId) {
       const id = String(sessionId || "default");
       state.agentChat.sessionId = id;
+      toggleChatPersonaPicker(false);
       const storage = agentChatStorage();
       let map = {};
       try { map = JSON.parse(storage?.getItem(AGENT_CHAT_SKILL_KEY) || "{}"); } catch { map = {}; }
@@ -7980,7 +8008,153 @@ ${cardFeedbackBarHtml()}`;
 
     function toggleChatSkillPicker(open) {
       state.agentChat.skillPickerOpen = open ?? !state.agentChat.skillPickerOpen;
+      if (state.agentChat.skillPickerOpen) toggleChatPersonaPicker(false);
       renderChatSkillPicker();
+    }
+
+    // 聊天风格由会话 metadata 持久化；角色的工具白名单独立保留。
+    function currentChatPersonaId() {
+      return String(currentChatSession()?.metadata?.persona || "natural");
+    }
+
+    function currentChatPersona() {
+      return state.agentChat.personas.find((item) => item.id === currentChatPersonaId()) || null;
+    }
+
+    function chatPersonaIsSaving() {
+      return state.agentChat.personaSaves.has(state.agentChat.sessionId || "default");
+    }
+
+    async function refreshChatPersonas() {
+      const agent = state.agentChat;
+      if (agent.personaCatalogLoading) return;
+      agent.personaCatalogLoading = true;
+      agent.personaCatalogError = "";
+      renderChatPersonaPicker();
+      try {
+        const payload = await requestJsonStrict(ENDPOINTS.chatPersonas, { cache: "no-store", timeoutMs: 8000 });
+        if (!Array.isArray(payload?.personas) || !payload.personas.length ||
+            payload.personas.some((item) => !item || typeof item.id !== "string" || !item.id || typeof item.title !== "string")) {
+          throw new Error("聊天风格列表暂时不可用");
+        }
+        agent.personas = payload.personas;
+        agent.personaExamplePrompt = String(payload.example_prompt || "");
+        if (!agent.personaDraft) agent.personaDraft = currentChatPersonaId();
+      } catch {
+        agent.personaCatalogError = "聊天风格加载失败，可以重试；仍可正常聊天。";
+      } finally {
+        agent.personaCatalogLoading = false;
+        renderChatPersonaPicker();
+      }
+    }
+
+    function renderChatPersonaState() {
+      const agent = state.agentChat;
+      const saving = chatPersonaIsSaving();
+      const persona = currentChatPersona();
+      const name = $("#chatPersonaName");
+      if (name) name.textContent = `${persona?.title || (currentChatPersonaId() === "natural" ? "自然朋友" : "已设定")}${saving ? " · 保存中…" : ""}`;
+      $("#chatPersonaChip")?.setAttribute("aria-expanded", String(agent.personaPickerOpen));
+      const panel = $("#chatPersonaPicker");
+      if (panel) panel.hidden = !agent.personaPickerOpen;
+      const status = $("#chatPersonaStatus");
+      const feedback = agent.personaStatusBySession.get(agent.sessionId || "default");
+      if (status) {
+        status.textContent = saving ? "正在保存，完成后即可发送消息…" :
+          (feedback?.message || `当前风格：${persona?.title || (currentChatPersonaId() === "natural" ? "自然朋友" : "已设定")}`);
+        status.classList.toggle("is-error", !saving && Boolean(feedback?.error));
+      }
+      const save = $("#chatPersonaSave");
+      if (save) {
+        save.disabled = saving || agent.personaCatalogLoading || Boolean(agent.personaCatalogError) ||
+          !currentChatSession() || !agent.personas.some((item) => item.id === agent.personaDraft) ||
+          agent.personaDraft === currentChatPersonaId();
+        save.textContent = saving ? "保存中…" : "应用到当前会话";
+      }
+      const send = $("#chatForm button[type='submit']");
+      if (send) send.disabled = saving;
+      $("#chatForm")?.setAttribute("aria-busy", String(saving));
+    }
+
+    function renderChatPersonaPreview() {
+      const preview = $("#chatPersonaPreview");
+      if (!preview) return;
+      const agent = state.agentChat;
+      const draft = agent.personas.find((item) => item.id === agent.personaDraft);
+      preview.hidden = !draft;
+      preview.innerHTML = draft ? `<p class="chat-persona-example-label">回复示例${agent.personaExamplePrompt ? ` · ${escapeHtml(agent.personaExamplePrompt)}` : ""}</p><blockquote>${escapeHtml(String(draft.example || ""))}</blockquote>` : "";
+      renderChatPersonaState();
+    }
+
+    function renderChatPersonaPicker() {
+      renderChatPersonaState();
+      if (!state.agentChat.personaPickerOpen) return;
+      const options = $("#chatPersonaOptions");
+      if (!options) return;
+      const agent = state.agentChat;
+      if (agent.personaCatalogLoading) {
+        options.innerHTML = '<p class="chat-persona-help" role="status">正在加载聊天风格…</p>';
+      } else if (agent.personaCatalogError) {
+        options.innerHTML = `<p class="chat-persona-error" role="alert">${escapeHtml(agent.personaCatalogError)}</p><button type="button" class="pill-btn" data-persona-retry>重新加载</button>`;
+      } else {
+        options.innerHTML = `<fieldset class="chat-persona-options" ${chatPersonaIsSaving() ? "disabled" : ""}><legend class="sr-only">聊天风格模板</legend>${agent.personas.map((item) => `<label class="chat-persona-option"><input type="radio" name="chatPersona" value="${escapeHtml(item.id)}" ${item.id === agent.personaDraft ? "checked" : ""}><span><strong>${escapeHtml(item.title)}</strong><span class="chat-persona-description">${escapeHtml(String(item.description || ""))}</span></span></label>`).join("")}</fieldset>`;
+      }
+      renderChatPersonaPreview();
+    }
+
+    function toggleChatPersonaPicker(open, { restoreFocus = false } = {}) {
+      const agent = state.agentChat;
+      const next = open ?? !agent.personaPickerOpen;
+      if (next && !agent.personaPickerOpen) {
+        agent.personaDraft = agent.personaSaves.get(agent.sessionId || "default")?.personaId || currentChatPersonaId();
+        agent.skillPickerOpen = false;
+        renderChatSkillPicker();
+      }
+      agent.personaPickerOpen = next;
+      renderChatPersonaPicker();
+      if (next) {
+        if (!agent.personas.length && !agent.personaCatalogLoading) void refreshChatPersonas();
+        $("#chatPersonaOptions input:checked")?.focus();
+      } else if (restoreFocus) $("#chatPersonaChip")?.focus();
+    }
+
+    async function saveChatPersona() {
+      const agent = state.agentChat;
+      const sessionId = agent.sessionId || "default";
+      const personaId = agent.personaDraft;
+      if (agent.personaSaves.has(sessionId) || !currentChatSession() ||
+          !agent.personas.some((item) => item.id === personaId) || personaId === currentChatPersonaId()) return;
+      const operation = { personaId };
+      agent.personaSaves.set(sessionId, operation);
+      agent.personaStatusBySession.delete(sessionId);
+      ++chatSessionsGeneration;
+      renderChatPersonaPicker();
+      try {
+        const session = await requestJsonStrict(`${ENDPOINTS.chatSessions}/${encodeURIComponent(sessionId)}`, {
+          method: "PATCH",
+          timeoutMs: 10000,
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ persona: personaId }),
+        });
+        if (session?.session_id !== sessionId || session?.metadata?.persona !== personaId) {
+          throw new Error("保存结果尚未确认，请刷新会话后重试");
+        }
+        // Invalidate older session-list GETs that could arrive after the PATCH.
+        ++chatSessionsGeneration;
+        const index = agent.sessions.findIndex((item) => item?.session_id === sessionId);
+        if (index >= 0) agent.sessions[index] = session;
+        chatSessionsSignature = "";
+        const title = agent.personas.find((item) => item.id === personaId)?.title || personaId;
+        agent.personaStatusBySession.set(sessionId, { message: `已保存「${title}」，从下一条消息生效。`, error: false });
+      } catch (error) {
+        agent.personaStatusBySession.set(sessionId, {
+          message: Number(error?.status) === 404 ? "会话暂时无法保存，请刷新会话后重试。" :
+            "风格保存未确认，请重试或刷新会话查看结果。", error: true,
+        });
+      } finally {
+        if (agent.personaSaves.get(sessionId) === operation) agent.personaSaves.delete(sessionId);
+        if (sessionId === (agent.sessionId || "default")) renderChatPersonaPicker();
+      }
     }
 
     // ── 流式 agent 对话 ──
@@ -11822,7 +11996,7 @@ ${cardFeedbackBarHtml()}`;
         // Use the same scoped durable-turn renderer as later refreshes. The
         // initial snapshot must not briefly show delight-only history or
         // flatten probe turns into an untracked user/assistant pair.
-        applyDialogueChatSnapshot(snapshot);
+        if (!agentChatEnabled()) applyDialogueChatSnapshot(snapshot);
       }
 
       function applyDelightChatSnapshot(snapshot) {
@@ -13151,6 +13325,19 @@ ${cardFeedbackBarHtml()}`;
       applyAgentChatChrome();
     });
     safeBind("#chatSkillChip", "click", () => toggleChatSkillPicker());
+    safeBind("#chatPersonaChip", "click", () => toggleChatPersonaPicker());
+    safeBind("#chatPersonaClose", "click", () => toggleChatPersonaPicker(false, { restoreFocus: true }));
+    safeBind("#chatPersonaSave", "click", () => void saveChatPersona());
+    $("#chatPersonaOptions")?.addEventListener("change", (event) => {
+      const input = event.target;
+      if (!(input instanceof HTMLInputElement) || input.name !== "chatPersona" || chatPersonaIsSaving()) return;
+      state.agentChat.personaDraft = input.value;
+      state.agentChat.personaStatusBySession.delete(state.agentChat.sessionId || "default");
+      renderChatPersonaPreview();
+    });
+    $("#chatPersonaOptions")?.addEventListener("click", (event) => {
+      if (event.target instanceof Element && event.target.closest("[data-persona-retry]")) void refreshChatPersonas();
+    });
     $("#chatSkillPicker")?.addEventListener("click", (event) => {
       const target = event.target instanceof Element ? event.target : null;
       const option = target?.closest("[data-skill-pick]");
@@ -13161,6 +13348,10 @@ ${cardFeedbackBarHtml()}`;
     // Escape 关闭 skill 选择弹层；点击弹层外也收起。
     document.addEventListener("keydown", (event) => {
       if (event.key === "Escape" && state.agentChat.skillPickerOpen) toggleChatSkillPicker(false);
+      if (event.key === "Escape" && state.agentChat.personaPickerOpen) {
+        event.preventDefault();
+        toggleChatPersonaPicker(false, { restoreFocus: true });
+      }
     });
     document.addEventListener("click", (event) => {
       if (!state.agentChat.skillPickerOpen) return;
@@ -13195,7 +13386,7 @@ ${cardFeedbackBarHtml()}`;
       state.agentChat.approvalsOpen = false;
       renderChatApprovalsPanelVisibility();
     });
-    safeBind("#chatForm", "submit", (event) => { event.preventDefault(); const input = $("#chatInput"); const text = input?.value?.trim() || ""; if (!text) return; input.value = ""; sendChat(text); });
+    safeBind("#chatForm", "submit", (event) => { event.preventDefault(); if (chatPersonaIsSaving()) return; const input = $("#chatInput"); const text = input?.value?.trim() || ""; if (!text) return; input.value = ""; sendChat(text); });
     safeBind("#messageChatBackBtn", "click", returnToMessages);
     safeBind("#messageChatForm", "submit", (event) => {
       event.preventDefault();

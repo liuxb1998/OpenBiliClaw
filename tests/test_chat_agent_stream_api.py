@@ -47,6 +47,7 @@ class FakeAgentDialogue:
         skill: Any = None,
         tools: Any = None,
         skill_switch_guide: str = "",
+        persona_id: str = "natural",
     ) -> Any:
         self.agent_calls.append(
             {
@@ -59,6 +60,7 @@ class FakeAgentDialogue:
                 "skill": skill,
                 "tools": tools,
                 "skill_switch_guide": skill_switch_guide,
+                "persona_id": persona_id,
             }
         )
         for item in self._script:
@@ -588,6 +590,130 @@ def test_agent_stream_uses_durable_skill_when_retry_omits_it(tmp_path: Path) -> 
         )
     assert _parse_sse(response.text)[-1][1]["skill"] == "system-steward"
     assert dialogue.agent_calls[0]["skill"].name == "system-steward"
+
+
+def test_agent_persona_is_frozen_for_stream_and_retry_without_changing_skill(
+    tmp_path: Path,
+) -> None:
+    from openbiliclaw.agent.tools import Tool, ToolRegistry
+
+    dialogue = FakeAgentDialogue([AgentEvent(type="final", text="好的")])
+    app = _app(tmp_path, dialogue)
+    app.state.runtime_context.agent_tool_registry = ToolRegistry(
+        [
+            Tool(name="get_profile", description="读画像", handler=lambda _: ""),
+            Tool(name="update_config", description="修改配置", handler=lambda _: ""),
+        ]
+    )
+    payload = {
+        "turn_id": "styled-turn",
+        "message": "你好",
+        "streaming": True,
+        "session_id": "styled",
+    }
+    with TestClient(app) as client:
+        assert (
+            client.post(
+                "/api/chat/sessions",
+                json={
+                    "session_id": "styled",
+                    "metadata": {"persona": "warm"},
+                },
+            ).status_code
+            == 200
+        )
+        first = client.post("/api/chat/turns", json=payload)
+        assert first.json()["payload"]["agent_persona"] == "warm"
+        assert (
+            client.patch("/api/chat/sessions/styled", json={"persona": "concise"}).status_code
+            == 200
+        )
+        # POST retry reuses the accepted turn rather than re-freezing the style.
+        assert (
+            client.post("/api/chat/turns", json=payload).json()["payload"]["agent_persona"]
+            == "warm"
+        )
+        streamed = client.post("/api/chat/agent/stream", json=payload)
+        assert _parse_sse(streamed.text)[-1][0] == "done"
+        replayed = client.post("/api/chat/agent/stream", json=payload)
+        assert _parse_sse(replayed.text) == _parse_sse(streamed.text)
+        assert len(dialogue.agent_calls) == 1
+        first_call = dialogue.agent_calls[0]
+        assert first_call["persona_id"] == "warm"
+        assert first_call["skill"].name == "taste-companion"
+        # Ephemeral sends snapshot the currently selected style instead.
+        client.post("/api/chat/agent/stream", json={"session_id": "styled", "message": "谢谢"})
+        assert dialogue.agent_calls[-1]["persona_id"] == "concise"
+        assert dialogue.agent_calls[-1]["skill"] == first_call["skill"]
+        assert dialogue.agent_calls[-1]["tools"].names == first_call["tools"].names
+        assert "update_config" not in first_call["tools"].names
+        next_turn = client.post("/api/chat/turns", json={**payload, "turn_id": "next-turn"})
+        assert next_turn.json()["payload"]["agent_persona"] == "concise"
+
+
+def test_agent_worker_recovery_uses_persisted_persona_after_restart(tmp_path: Path) -> None:
+    dialogue = FakeAgentDialogue([AgentEvent(type="final", text="恢复完成")])
+    app = _app(tmp_path, dialogue)
+    payload = {"turn_id": "orphan-style", "message": "你好", "streaming": True}
+    with TestClient(app) as client:
+        client.patch("/api/chat/sessions/default", json={"persona": "analytical"})
+        created = client.post("/api/chat/turns", json=payload)
+        assert created.json()["payload"]["agent_persona"] == "analytical"
+        client.patch("/api/chat/sessions/default", json={"persona": "playful"})
+    assert dialogue.agent_calls == []
+    recovered_dialogue = FakeAgentDialogue([AgentEvent(type="final", text="恢复完成")])
+    recovered_app = _app(tmp_path, recovered_dialogue)
+    with TestClient(recovered_app) as client:
+        assert (
+            client.post("/api/chat/turns", json={**payload, "streaming": False}).status_code == 200
+        )
+        deadline = time.monotonic() + 5
+        while time.monotonic() < deadline:
+            row = recovered_app.state.runtime_context.database.get_chat_turn("orphan-style")
+            if row["status"] != "pending":
+                break
+            time.sleep(0.01)
+        assert row["status"] == "completed"
+        assert row["payload"]["agent_persona"] == "analytical"
+    assert len(recovered_dialogue.agent_calls) == 1
+    assert recovered_dialogue.agent_calls[0]["persona_id"] == "analytical"
+    assert recovered_dialogue.legacy_calls == []
+
+
+def test_old_turn_uses_natural_and_clients_cannot_forge_persona(tmp_path: Path) -> None:
+    dialogue = FakeAgentDialogue([AgentEvent(type="final", text="好的")])
+    app = _app(tmp_path, dialogue)
+    database = app.state.runtime_context.database
+    database.create_chat_turn(turn_id="old-style", message="旧消息", payload={"agent_stream": True})
+    with TestClient(app) as client:
+        client.patch("/api/chat/sessions/default", json={"persona": "warm"})
+        client.post("/api/chat/agent/stream", json={"turn_id": "old-style", "message": "旧消息"})
+        assert dialogue.agent_calls[0]["persona_id"] == "natural"
+        for endpoint in ("/api/chat/turns", "/api/chat/agent/stream"):
+            forged = client.post(
+                endpoint,
+                json={
+                    "turn_id": "forged-style",
+                    "message": "你好",
+                    "streaming": True,
+                    "payload": {"agent_persona": "warm"},
+                },
+            )
+            assert forged.status_code == 422
+        assert database.get_chat_turn("forged-style") is None
+        assert len(dialogue.agent_calls) == 1
+        legacy = client.post("/api/chat/turns", json={"message": "旧入口"}).json()
+        assert "agent_persona" not in legacy["payload"]
+        scoped = client.post(
+            "/api/chat/turns",
+            json={
+                "message": "非普通聊天",
+                "scope": "probe",
+                "subject_id": "test",
+                "streaming": True,
+            },
+        ).json()
+        assert "agent_persona" not in scoped["payload"]
 
 
 async def test_agent_stream_disconnect_keeps_single_execution_running(tmp_path: Path) -> None:

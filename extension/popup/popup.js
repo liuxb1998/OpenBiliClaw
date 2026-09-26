@@ -149,6 +149,7 @@ import {
   streamChatTurn,
   streamAgentChatTurn,
   fetchChatSkills,
+  fetchChatPersonas,
   fetchChatSessions,
   createChatSession,
   updateChatSession,
@@ -400,6 +401,11 @@ const elements = {
   chatSubpanelSessions: document.getElementById("chatSubpanelSessions"),
   chatSubpanelTasks: document.getElementById("chatSubpanelTasks"),
   chatSkillSelect: document.getElementById("chatSkillSelect"),
+  chatPersonaToggle: document.getElementById("chatPersonaToggle"),
+  chatPersonaDialog: document.getElementById("chatPersonaDialog"),
+  chatPersonaList: document.getElementById("chatPersonaList"),
+  chatPersonaStatus: document.getElementById("chatPersonaStatus"),
+  chatPersonaExamplePrompt: document.getElementById("chatPersonaExamplePrompt"),
   chatApprovalsToggle: document.getElementById("chatApprovalsToggle"),
   chatApprovalsCount: document.getElementById("chatApprovalsCount"),
   chatApprovalsList: document.getElementById("chatApprovalsList"),
@@ -714,6 +720,12 @@ let popupSessionSkills = (() => {
   }
 })();
 let popupChatSkills = [];
+let popupChatPersonas = [];
+let popupPersonaExamplePrompt = "";
+let popupPersonaError = "";
+let popupPersonaRevision = 0;
+let popupSessionsRequestGeneration = 0;
+const popupPersonaSaving = new Set();
 let agentLoopAvailable = true;
 // Live process-flow runs keyed by turn_id; settled runs stay until the
 // durable history snapshot (payload.agent_events) replaces them.
@@ -1004,6 +1016,7 @@ function setActiveTab(requestedTab, { libraryTab = "" } = {}) {
     void refreshPendingConfirmations();
     void hydrateChatHistory();
     void refreshChatSkills();
+    void refreshChatPersonas();
     void refreshChatApprovals();
     void refreshAgentTasks();
     syncPopupTasksPolling();
@@ -6053,6 +6066,94 @@ async function refreshChatSkills() {
   renderChatSkillSelect();
 }
 
+function currentPopupPersona() {
+  const session = popupChatSessions.find((item) => item.session_id === popupChatSessionId);
+  return String(session?.metadata?.persona || "natural");
+}
+
+function rememberPopupChatSession(session) {
+  const index = popupChatSessions.findIndex((item) => item.session_id === session?.session_id);
+  if (!session?.session_id) return;
+  if (session.session_id === popupChatSessionId && index >= 0
+    && popupChatSessions[index]?.metadata?.persona !== session.metadata?.persona
+    && !popupPersonaSaving.has(session.session_id)) popupPersonaError = "";
+  if (index >= 0) popupChatSessions[index] = session;
+  else popupChatSessions.push(session);
+}
+
+async function refreshChatPersonas() {
+  if (!state.online) return;
+  const revision = popupPersonaRevision;
+  try {
+    const catalog = await fetchChatPersonas();
+    popupChatPersonas = catalog.personas;
+    popupPersonaExamplePrompt = catalog.examplePrompt;
+    if (revision === popupPersonaRevision && !popupPersonaError.startsWith("尚未确认")) popupPersonaError = "";
+  } catch {
+    popupPersonaError = "暂时无法加载聊天风格，请稍后重试。";
+  }
+  renderPopupPersonaPicker();
+}
+
+function renderPopupPersonaPicker() {
+  const selected = currentPopupPersona();
+  const saving = popupPersonaSaving.has(popupChatSessionId);
+  const persona = popupChatPersonas.find((item) => item.id === selected);
+  if (elements.chatPersonaToggle) {
+    elements.chatPersonaToggle.textContent = `风格 · ${saving ? "保存中…" : (persona?.title || "自然朋友")}`;
+    elements.chatPersonaToggle.disabled = !state.online;
+    elements.chatPersonaToggle.setAttribute("aria-busy", String(saving));
+  }
+  if (!elements.chatPersonaDialog?.open) return;
+  elements.chatPersonaExamplePrompt.textContent = popupPersonaExamplePrompt ? `例如你说：“${popupPersonaExamplePrompt}”` : "";
+  elements.chatPersonaExamplePrompt.hidden = !popupPersonaExamplePrompt;
+  elements.chatPersonaStatus.textContent = saving ? "正在保存…" : popupPersonaError;
+  const key = JSON.stringify([selected, saving, popupChatPersonas]);
+  if (elements.chatPersonaList.dataset.renderKey === key) return;
+  elements.chatPersonaList.dataset.renderKey = key;
+  const focused = document.activeElement?.dataset?.chatPersona;
+  elements.chatPersonaList.innerHTML = popupChatPersonas.map((item) => `
+    <button type="button" class="chat-persona-option" data-chat-persona="${agentChat.escapeHtml(item.id)}"
+      aria-pressed="${item.id === selected}" ${saving ? "disabled" : ""}>
+      <strong>${agentChat.escapeHtml(item.title)}${item.id === selected ? ' <span>当前</span>' : ""}</strong>
+      <span>${agentChat.escapeHtml(item.description)}</span>
+      <span class="chat-persona-example">示例：${agentChat.escapeHtml(item.example)}</span>
+    </button>`).join("");
+  if (focused) {
+    [...elements.chatPersonaList.querySelectorAll("[data-chat-persona]")]
+      .find((button) => button.dataset.chatPersona === focused)?.focus();
+  }
+}
+
+async function selectPopupPersona(personaId) {
+  const sessionId = popupChatSessionId;
+  if (popupPersonaSaving.has(sessionId) || !popupChatPersonas.some((item) => item.id === personaId)) return;
+  popupPersonaSaving.add(sessionId);
+  popupPersonaRevision += 1;
+  popupPersonaError = "";
+  renderPopupPersonaPicker();
+  try {
+    const session = await updateChatSession(sessionId, { persona: personaId });
+    if (session?.session_id !== sessionId || session?.metadata?.persona !== personaId) {
+      throw new Error("服务未确认所选风格，请重试。");
+    }
+    rememberPopupChatSession(session);
+    if (sessionId === popupChatSessionId) {
+      elements.chatPersonaDialog.close();
+      setChatStatus("聊天风格已保存，用于本会话的新消息。", "success");
+    }
+  } catch {
+    if (sessionId === popupChatSessionId) {
+      popupPersonaError = "尚未确认风格已保存，请刷新或重试。";
+      setChatStatus(popupPersonaError, "error");
+    }
+  } finally {
+    popupPersonaRevision += 1;
+    popupPersonaSaving.delete(sessionId);
+    renderPopupPersonaPicker();
+  }
+}
+
 function renderChatSkillSelect() {
   if (!(elements.chatSkillSelect instanceof HTMLSelectElement)) return;
   const selected = currentPopupSkill();
@@ -6141,12 +6242,17 @@ function renderChatApprovals() {
 
 async function refreshChatSessions() {
   if (!state.online) return;
+  const generation = ++popupSessionsRequestGeneration;
+  const revision = popupPersonaRevision;
   try {
-    popupChatSessions = await fetchChatSessions();
+    const sessions = await fetchChatSessions();
+    if (generation !== popupSessionsRequestGeneration || revision !== popupPersonaRevision || popupPersonaSaving.size) return;
+    popupChatSessions = sessions;
   } catch {
     // Keep the last list while offline.
   }
   if (popupChatSubtab === "sessions") renderChatSessionsPanel();
+  renderPopupPersonaPicker();
 }
 
 function renderChatSessionsPanel() {
@@ -6169,7 +6275,10 @@ function renderChatSessionsPanel() {
 
 async function switchPopupChatSession(sessionId) {
   if (!sessionId) return;
+  elements.chatPersonaDialog?.close();
+  popupPersonaError = "";
   popupChatSessionId = sessionId;
+  renderPopupPersonaPicker();
   chatHistoryHydrationGeneration += 1;
   chatHistoryHydrationInFlight = false;
   try {
@@ -6967,6 +7076,7 @@ async function hydrateChatHistory() {
   chatHistoryHydrationInFlight = true;
   const sessionId = popupChatSessionId;
   const generation = ++chatHistoryHydrationGeneration;
+  const personaRevision = popupPersonaRevision;
   const messages = elements.chatMessages;
   const shouldStickToBottom = isChatMessagesNearBottom();
   const previousScrollTop = messages.scrollTop;
@@ -6981,6 +7091,10 @@ async function hydrateChatHistory() {
         throw error;
       });
     if (generation !== chatHistoryHydrationGeneration || sessionId !== popupChatSessionId) return;
+    if (payload.session && personaRevision === popupPersonaRevision && !popupPersonaSaving.has(sessionId)) {
+      rememberPopupChatSession(payload.session);
+      renderPopupPersonaPicker();
+    }
     const nextTurns = selectDialogueTurns(payload.items || []);
     const signature = chatHistorySignature(nextTurns);
     if (signature === lastChatHistorySignature) return;
@@ -8756,6 +8870,23 @@ function bindDialogueConfirmations() {
       );
     });
   }
+  elements.chatPersonaToggle?.addEventListener("click", () => {
+    popupPersonaError = "";
+    elements.chatPersonaDialog.showModal();
+    renderPopupPersonaPicker();
+    void refreshChatPersonas();
+  });
+  elements.chatPersonaDialog?.addEventListener("click", (event) => {
+    const target = event.target instanceof Element ? event.target : null;
+    if (target === elements.chatPersonaDialog || target?.closest("[data-persona-close]")) {
+      elements.chatPersonaDialog.close();
+    } else if (target?.closest("[data-persona-retry]")) {
+      void refreshChatPersonas();
+    } else {
+      const button = target?.closest("[data-chat-persona]");
+      if (button) void selectPopupPersona(button.dataset.chatPersona);
+    }
+  });
   for (const button of [elements.chatSubtabChat, elements.chatSubtabSessions, elements.chatSubtabTasks]) {
     if (button instanceof HTMLButtonElement) {
       button.addEventListener("click", () => setChatSubtab(button.dataset.chatSubtab || "chat"));
@@ -8877,6 +9008,10 @@ function bindChat() {
 
   elements.chatForm.addEventListener("submit", async (event) => {
     event.preventDefault();
+    if (popupPersonaSaving.has(popupChatSessionId)) {
+      setChatStatus("正在保存聊天风格，请稍后发送。", "info");
+      return;
+    }
     const message = elements.chatInput.value.trim();
     if (!message) {
       setHint("先说一句你的想法、偏好或者最近状态。", "error");

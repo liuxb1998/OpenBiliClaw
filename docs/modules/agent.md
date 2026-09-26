@@ -28,9 +28,27 @@ M9 交付移动 Web（`web/js/views/chat.js`）与插件 popup（`extension/popu
 | M1 多跳 AgentLoop | ✅ | `agent/loop.py`：`AgentLoop.run()` 异步生成器逐跳产出事件，默认 64 跳上限（`[agent]` 配置），超限后无工具收尾汇报 |
 | M2 SSE 流式接线 | ✅ | 新端点 `POST /api/chat/agent/stream` 真流式转发 `AgentEvent`；`SocraticDialogue.stream_agent_reply()` 复用 persona prompt / 历史 / 学习队列；loop 事件随 turn 落 `payload.agent_events`；旧 `/api/chat` 与 `/api/chat/stream`（假流式）保持共存 |
 | M3 v1 工具集（14 个） | ✅ | 见下文「v1 标准工具集」：`AgentToolContext` + `build_agent_tool_registry()` 总装，read / soft_write / hard_write 三级权限，handler 全部防御性降级 |
+| 会话聊天风格 | ✅ | 六种表达模板独立于功能角色；会话持久化、发送时冻结，三端选择与示例预览，工具权限保持 |
 | M4 skill 加载与切换 | ✅ | `agent/skill.py`：`SkillDefinition` + `*/SKILL.md` 解析（手写 frontmatter 子集，无 YAML 依赖）+ `load_skill_catalog()`（内置 → `data/skills/` 覆盖，非法文件跳过记日志）；4 个内置 skill；`suggest_skill` 元工具 + 端点 skill 绑定，见下文「Skill 体系（M4）」 |
 | M6 任务中心（durable 后台任务） | ✅ | `agent/tasks.py`：`AgentTaskRunner` 在 `BackgroundTaskRegistry` 登记的 asyncio task 里跑**只读** AgentLoop（`filter_by_permission("read")` ∩ skill 白名单），事件逐步落 `agent_tasks.steps`；写动作只经 `propose_suggestion` 元工具产出结构化建议清单，完成后往来源会话写汇总消息；交互侧另有 `start_background_task` 元工具（同 suggest_skill 确认卡模式）。见下文「任务中心（M6）」 |
 | M7 L2 审批门 | ✅ | `agent/approvals.py`：loop 拦截 hard_write 调用 → `approval_request` SSE 事件 + durable 审批记录（JSON 文件存储，免迁移）；`/api/chat/approvals` 端点批准（立即返回 + 后台任务二次 dispatch 真执行，幂等）/拒绝；审计落 `profile_update_ledger`。见下文「L2 审批门（M7）」 |
+
+## 聊天风格：与功能角色独立
+
+`agent/persona.py` 定义六个表达模板：`natural` 自然朋友（默认）、`concise` 简洁直接、
+`warm` 温柔倾听、`playful` 轻松幽默、`analytical` 理性分析、`socratic` 循循善诱。
+`GET /api/chat/personas` 返回标题、说明、同题回复示例与 `example_prompt`；模板不增加
+工具，所有权限仍由所选 skill 决定。用户可以组合任意功能角色和聊天风格。
+
+会话选择通过 `PATCH /api/chat/sessions/{id}` 的 `persona` 写入 `metadata.persona`；
+创建 agent chat turn 时冻结到服务端保留字段 `payload.agent_persona`，SSE、重试和
+后台恢复均读取冻结值。缺失或旧存量风格按 natural 处理，非法新选择返回 422。
+切换只影响新消息，不触发配置重载或额外 LLM 调用。
+
+公开 helpers：`resolve_chat_persona()` 读取兼容默认，`validate_chat_persona()` 校验
+新输入，`chat_persona_instruction()` 返回可选表达层。natural 维持原 prompt；显式
+其他风格优先于旧全局语气中冲突的表达规则，用户当前篇幅要求与事实、工具、审批规则
+始终优先。所有模板都保持简单问题简答，不强制追问或展开分析。
 
 ## 模块结构
 
@@ -39,6 +57,7 @@ agent/
 ├── loop.py              # AgentLoop + AgentEvent（多跳循环与事件模型，含 M7 审批拦截）
 ├── approvals.py         # ApprovalStore + ApprovalRecord（M7 审批台账，JSON 文件持久化）
 ├── orchestrator.py      # 既有空壳编排器（未接 loop）
+├── persona.py           # 独立表达模板目录（不授予工具权限）
 ├── skill.py             # SkillDefinition / SkillCatalog / SKILL.md 加载（M4）
 │                        # + 既有 Skill ABC / SkillRegistry 代码技能骨架（未使用）
 ├── tasks.py             # AgentTaskRunner + propose_suggestion / start_background_task 元工具（M6）

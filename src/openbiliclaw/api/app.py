@@ -48,6 +48,7 @@ from fastapi.responses import (
 )
 from starlette.background import BackgroundTask
 
+from openbiliclaw.agent.persona import CHAT_PERSONAS, PERSONA_EXAMPLE_PROMPT, resolve_chat_persona
 from openbiliclaw.api.models import (
     ActivityFeedItemOut,
     ActivityFeedResponse,
@@ -5136,11 +5137,13 @@ def create_app(
         return method
 
     def _normalize_chat_session(row: Mapping[str, Any]) -> ChatSessionOut:
+        metadata = dict(row.get("metadata", {}) or {})
+        metadata["persona"] = resolve_chat_persona(metadata.get("persona")).id
         return ChatSessionOut(
             session_id=str(row.get("session_id", "")),
             title=str(row.get("title", "") or ""),
             archived=bool(row.get("archived", False)),
-            metadata=dict(row.get("metadata", {}) or {}),
+            metadata=metadata,
             turn_count=int(row.get("turn_count", 0) or 0),
             active_turns=int(row.get("active_turns", 0) or 0),
             last_message_preview=str(row.get("last_message_preview", "") or ""),
@@ -5149,6 +5152,13 @@ def create_app(
             updated_at=str(row.get("updated_at", "") or ""),
             last_message_at=str(row.get("last_message_at", "") or ""),
         )
+
+    def _session_persona_id(session_id: str) -> str:
+        """Snapshot a conversation's current style without changing legacy rows."""
+        get_session = _chat_db_method("get_chat_session")
+        row = get_session(session_id) if get_session is not None else None
+        metadata = row.get("metadata", {}) if row else {}
+        return resolve_chat_persona(metadata.get("persona")).id
 
     def _resolve_chat_session_id(payload: ChatTurnIn) -> str:
         """Resolve the owning session for a new turn, validating explicit ids."""
@@ -11661,6 +11671,15 @@ def create_app(
         else:
             effective_session_id = DEFAULT_CHAT_SESSION_ID
 
+        # A durable turn owns its style forever, including old turns whose
+        # missing marker means natural. Only ephemeral requests consult the
+        # current session, once, before waiting for the dialogue lane.
+        persona_id = (
+            resolve_chat_persona(turn.payload.get("agent_persona")).id
+            if turn is not None
+            else _session_persona_id(effective_session_id)
+        )
+
         async def _event_stream() -> AsyncIterator[str]:
             import json as _json
 
@@ -11725,6 +11744,7 @@ def create_app(
                             else ""
                         ),
                         **binding_kwargs,
+                        **_agent_persona_kwargs(persona_id, stream_fn),
                     ):
                         data = event.to_dict()
                         if turn_id:
@@ -12424,6 +12444,15 @@ def create_app(
             return {"dialogue_binding": binding}
         return {}
 
+    def _agent_persona_kwargs(persona_id: str, stream_fn: Any) -> dict[str, str]:
+        """Thread style through real owners while retaining narrow legacy doubles."""
+        parameters = inspect.signature(stream_fn).parameters
+        if "persona_id" in parameters or any(
+            param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()
+        ):
+            return {"persona_id": persona_id}
+        return {}
+
     async def _generate_durable_agent_turn_reply(
         turn: ChatTurnOut, dialogue_owner: Any
     ) -> tuple[str, list[dict[str, Any]]] | None:
@@ -12463,6 +12492,9 @@ def create_app(
                 else ""
             ),
             **_agent_turn_binding_kwargs(turn, stream_fn),
+            **_agent_persona_kwargs(
+                resolve_chat_persona(turn.payload.get("agent_persona")).id, stream_fn
+            ),
         ):
             events.append(event.to_dict())
             _append_chat_turn_agent_event(turn.turn_id, event.to_dict())
@@ -13489,6 +13521,8 @@ def create_app(
             # and its ``agent_events`` replay stream stay consistent with
             # the interactive path.
             structured_payload["agent_stream"] = True
+            if canonical_scope == "chat":
+                structured_payload["agent_persona"] = _session_persona_id(resolved_session_id)
             if payload.skill.strip():
                 structured_payload["agent_skill"] = payload.skill.strip()
         row = _create_chat_turn_row(
@@ -13928,6 +13962,14 @@ def create_app(
 
     # --- Multi-session chat endpoints (「聊一聊」 M5) ---
 
+    @app.get("/api/chat/personas")
+    async def list_chat_personas() -> dict[str, Any]:
+        """List expression presets independently of the capability skill catalog."""
+        return {
+            "example_prompt": PERSONA_EXAMPLE_PROMPT,
+            "personas": [persona.public_dict() for persona in CHAT_PERSONAS],
+        }
+
     @app.post("/api/chat/sessions", response_model=ChatSessionOut)
     async def create_chat_session(payload: ChatSessionCreateIn) -> ChatSessionOut:
         """Create one chat conversation; title auto-generates on first message."""
@@ -13980,12 +14022,16 @@ def create_app(
 
     @app.patch("/api/chat/sessions/{session_id}", response_model=ChatSessionOut)
     async def update_chat_session(session_id: str, payload: ChatSessionPatchIn) -> ChatSessionOut:
-        """Rename and/or archive one conversation; the default session cannot be archived."""
+        """Edit conversation preferences; the default session cannot be archived."""
         get_session = _chat_session_db_method("get_chat_session")
         get_summary = _chat_session_db_method("get_chat_session_summary")
         normalized_id = session_id.strip()
         if get_session(normalized_id) is None:
             raise HTTPException(status_code=404, detail="Chat session not found.")
+        if payload.archived and normalized_id == DEFAULT_CHAT_SESSION_ID:
+            raise HTTPException(
+                status_code=422, detail="The default chat session cannot be archived"
+            )
         if payload.title is not None:
             title = payload.title.strip()
             if not title:
@@ -13998,6 +14044,10 @@ def create_app(
                 )
             except ValueError as exc:
                 raise HTTPException(status_code=422, detail=str(exc)) from exc
+        if payload.persona is not None:
+            _chat_session_db_method("set_chat_session_persona")(
+                normalized_id, persona=payload.persona
+            )
         row = get_summary(normalized_id)
         if row is None:  # pragma: no cover - guarded by the check above
             raise HTTPException(status_code=404, detail="Chat session not found.")

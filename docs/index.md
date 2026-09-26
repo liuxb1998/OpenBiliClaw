@@ -32,6 +32,7 @@
 - [GitHub 来源文档](modules/github.md) / [冻结契约](platform-source-contract.github.toml) / [验收记录](platform-source-acceptance.github.md) — 官方只读 REST API、公开 repository discovery、starred repositories 初始化与三端文字卡
 - [Linux.do 来源文档](modules/linuxdo.md) — 扩展同源只读 GET、五路 discovery、三类个人 bootstrap、布尔登录态与隐私边界
 - [知乎来源文档](modules/zhihu.md) — 浏览器任务、布尔登录态、全局 `知乎收藏` 开关与新文档零点击确认边界
+- [聊天风格模板验收](testing/2026-09-26-chat-personas.md) — 六种会话风格、三端真实请求与跨设备保存、移动布局和验证边界
 - [手动端到端联调](manual-e2e.md) — CLI、插件与 SQLite 的真实联调步骤
 - [Agent 机器契约 (短)](agent-install.md) — 给 AI 智能体读取的短部署契约,配合 README 的短粘贴语句
 - [Agent 部署详细说明](agent-deployment.md) — 给人看的详细版本 + 所有 JSON 事件/错误码/排查表

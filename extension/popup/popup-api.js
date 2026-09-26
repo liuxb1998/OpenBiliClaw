@@ -1045,6 +1045,14 @@ export async function fetchChatSkills() {
   return agentChatShared().normalizeChatSkillList(data);
 }
 
+export async function fetchChatPersonas() {
+  const data = await requestJson("/chat/personas", { timeoutMs: 5_000 });
+  return {
+    personas: Array.isArray(data?.personas) ? data.personas : [],
+    examplePrompt: String(data?.example_prompt || ""),
+  };
+}
+
 export async function fetchChatSessions({ includeArchived = false, limit = 100 } = {}) {
   const params = new URLSearchParams({ limit: String(Math.max(1, Math.min(500, limit))) });
   if (includeArchived) params.set("include_archived", "true");
@@ -1063,12 +1071,14 @@ export async function createChatSession({ title = "", sessionId = "" } = {}) {
   });
 }
 
-export async function updateChatSession(sessionId, { title, archived } = {}) {
+export async function updateChatSession(sessionId, { title, archived, persona } = {}) {
   const body = {};
   if (typeof title === "string") body.title = title;
   if (typeof archived === "boolean") body.archived = archived;
+  if (typeof persona === "string") body.persona = persona;
   return requestJson(`/chat/sessions/${encodeURIComponent(String(sessionId || ""))}`, {
     method: "PATCH",
+    timeoutMs: 10_000,
     headers: { "Content-Type": "application/json" },
     body: JSON.stringify(body),
   });

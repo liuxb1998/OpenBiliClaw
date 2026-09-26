@@ -3541,6 +3541,23 @@ class Database:
         )
         return cursor.rowcount == 1
 
+    def set_chat_session_persona(self, session_id: str, *, persona: str) -> bool:
+        """Atomically replace only the persona key, preserving other metadata."""
+        cursor = self._execute_write(
+            """
+            UPDATE chat_sessions
+            SET metadata = json_set(
+                    CASE WHEN json_valid(metadata) THEN
+                        CASE WHEN json_type(metadata) = 'object' THEN metadata ELSE '{}' END
+                    ELSE '{}' END,
+                    '$.persona', ?),
+                updated_at = CURRENT_TIMESTAMP
+            WHERE session_id = ?
+            """,
+            (persona, session_id.strip()),
+        )
+        return cursor.rowcount == 1
+
     def touch_chat_session(self, session_id: str) -> bool:
         """Bump one session's last-message activity timestamp."""
         cursor = self._execute_write(
