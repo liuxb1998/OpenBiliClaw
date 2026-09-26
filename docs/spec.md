@@ -363,6 +363,7 @@ dialogue entries → app-stable execution lease(max active 1; reload pause/drain
                  → append payload.agent_events → SSE subscriber (disconnect keeps producer running)
                  → completion CAS + learning/effects; repeated turn → persisted event replay
                  → hard_write call → ApprovalStore pending card → approve endpoint re-dispatch → config_update_hook → settings apply queue / last-good + ledger audit
+                   → five known agent knobs only: replace loop; other changes: drain owners + rebuild
                  → start_background_task confirm → POST /api/chat/tasks
                  → read-only AgentLoop(caller=agent.task, interactive lane) → steps → agent_tasks
                  → terminal report → agent_task_summary durable turn in source session

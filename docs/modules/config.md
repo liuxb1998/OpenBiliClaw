@@ -1291,6 +1291,8 @@ Awareness seam 固定为 `legacy`。未发布的聚合字段
 - 首次启动的模板包含一个等待填写 Key 的 DeepSeek 占位实例；若用户在 `/setup/` 改选其他 Provider，向导会读取 `GET /api/config.issues`，只把其中明确指向 `llm.instances.<id>.*` 的 blocking 旧实例设为 `enabled=false` 并从全局链移除。被显式自定义模块链引用的实例不会被自动改写，正常或仅 warning 的既有实例也会保留；完整多实例整理仍由桌面/插件设置页负责。校验 400 会按 `ConfigUpdateResponse.config.issues` 展示具体原因，不再把响应 JSON 截成一段不可读文本。
 - 写盘前会先用新配置构建 LLM registry；blocking issue 会返回 400 且不写入 `config.toml`。
 - 聊天中批准的 `update_config` 与设置页共用保存锁、应用队列和 last-good 基线：保存最新磁盘配置上的单字段补丁并等待实际生效；不会提前修改 live Config，热重载失败回滚且审批报告 failed，后续设置保存失败也不会丢掉先前已批准的成功修改。
+- 单独改变 `[agent]` 的 `loop_enabled`、`loop_max_steps`、`tool_result_max_chars`、`session_title_enabled`、`task_max_steps` 时局部应用，不等待画像/反馈/对话学习任务；在途回合保留原预算，新回合使用新值。判断以完整候选与当前配置的差异为准，不以请求键名为准；只要混有其他未应用配置或未来新增字段变化，就保留完整安全排空。局部成功同样更新 last-good 和审批终态。
+- 上述资格仅限这些键的聊天审批；普通设置保存仍完整重载，以刷新配置对象外的 Cookie 等依赖。队列合并或失败接替不能丢失前一修订的完整重建要求；重复批准设置同值时也只有完整候选与当前配置严格相等才直接完成。
 - 写盘前会生成 `config.toml.bak`。持久化成功后接口统一返回 `202 apply_state="queued"` 和单调 `apply_revision`；后台热重载失败会恢复最后一次已生效的磁盘与内存 runtime 配置，并广播 `config_reload_failed`。如果恢复本身失败，状态接口保留人工恢复提示。
 - `general.data_dir` 是热重载的明确例外：如果请求值解析后的 canonical 路径不同于当前 `RuntimeContext` 已打开并由进程级锁保护的数据目录，接口会把新路径写入 `config.toml`，但本进程排队应用其它字段时仍强制使用旧的 active data dir，并在 202 响应返回 `restart_required=true`。当前数据库 / MemoryManager 和同一请求中的抖音、X 外部凭据读写都继续落在 active data dir；只有完整退出并重新启动、取得新目录的 canonical runtime lock 后才切换。`GET /api/config/apply-status` 的 `applied` 只表示可热重载部分已经应用，不表示新数据目录已启用。
 - 热重载与唯一 `DialogueSettlementQueue` 交接时保持 admission 开放，直到旧 worker 的 active job 与 backlog 真正排空，再在无 `await` 临界段原子暂停、撤销旧 permit 并注册新 worker；因此保存配置期间的聊天/待聊请求不再被直接丢弃。对话 LLM 单请求上限为 20 分钟，安全 drain 窗口相应为 25 分钟；桌面/插件自己的 60 秒请求预算到期只表示后端仍在等待安全切换，不会取消后端保存。超过 25 分钟才回滚，空字符串 `TimeoutError` 会转换为可读诊断。

@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 from collections import deque
+from datetime import UTC, datetime
 from typing import Any
 
 import pytest
 
 from openbiliclaw.agent.loop import AgentEvent, AgentLoop
+from openbiliclaw.agent.skill import load_skill_catalog
 from openbiliclaw.agent.tools import Tool, ToolRegistry
 from openbiliclaw.llm.base import LLMResponse
 from openbiliclaw.llm.service import LLMResponseContentError
@@ -40,6 +42,8 @@ class FakeAgentLLM:
                 "messages": [dict(message) for message in messages],
                 "tools": tools,
                 "caller": caller,
+                "max_tokens": max_tokens,
+                "reasoning_effort": reasoning_effort,
             }
         )
         item = self._responses.popleft()
@@ -98,6 +102,46 @@ async def _collect(stream: Any) -> list[AgentEvent]:
 
 
 class TestStreamAgentReply:
+    @pytest.mark.parametrize(
+        ("message", "reply"),
+        [
+            ("你好", "在。"),
+            ("现在几点？", "现在是 16:50。"),
+            ("原样复述：[09-26 16:50] 在。", "[09-26 16:50] 在。"),
+        ],
+    )
+    async def test_history_timestamps_are_context_not_automatic_reply_prefixes(
+        self, message: str, reply: str
+    ) -> None:
+        from openbiliclaw.llm.prompts import build_socratic_dialogue_prompt
+
+        loop, llm = _loop([LLMResponse(content="记住了。"), LLMResponse(content=reply)])
+        dialogue = SocraticDialogue(
+            llm=None,
+            soul_engine=object(),
+            llm_service=object(),
+            local_timezone=UTC,
+            now_provider=lambda: datetime(2026, 9, 26, 16, 50, tzinfo=UTC),
+            learning_mode=DialogueLearningMode.REPLY_ONLY_TEST,
+        )
+        await _collect(dialogue.stream_agent_reply(loop, "之前的话题", session_id="timed"))
+
+        events = await _collect(dialogue.stream_agent_reply(loop, message, session_id="timed"))
+
+        prompt = llm.calls[1]["messages"]
+        assert prompt[1] == {"role": "user", "content": "[09-26 16:50] 之前的话题"}
+        assert prompt[2] == {"role": "assistant", "content": "[09-26 16:50] 记住了。"}
+        assert "时间标签仅供理解上下文，不要复制为回复前缀" in prompt[0]["content"]
+        assert "用户询问时间时正常回答" in prompt[0]["content"]
+        # This is a model instruction, not a regex stripping legitimate text.
+        assert events[-1].text == reply
+        legacy = build_socratic_dialogue_prompt(
+            user_message=message, core_memory_text="", tone_profile=None, history=prompt[1:3]
+        )
+        assert legacy[1:3] == prompt[1:3]
+        assert "时间标签仅供理解上下文" not in legacy[0]["content"]
+        assert "请使用苏格拉底式对话风格" in legacy[0]["content"]
+
     async def test_streams_loop_events_and_records_history(self) -> None:
         loop, llm = _loop(
             [
@@ -119,7 +163,7 @@ class TestStreamAgentReply:
             "final",
         ]
         assert events[-1].text == "你最近很喜欢机械键盘相关的视频呢"
-        # The system prompt comes from the socratic persona builder.
+        # The system prompt retains the shared persona builder.
         first_call = llm.calls[0]
         assert first_call["messages"][0]["role"] == "system"
         assert "OpenBiliClaw" in first_call["messages"][0]["content"]
@@ -193,6 +237,46 @@ class TestStreamAgentReply:
         # 会话边界: "本对话/第一回合" means the current session (issue 6).
         assert "会话边界" in system
         assert "当前会话" in system
+
+    @pytest.mark.parametrize(
+        "skill_name", ["taste-companion", "bangumi-advisor", "system-steward", "taste-explorer"]
+    )
+    async def test_skill_prompt_scales_response_to_request_without_extra_model_hop(
+        self, skill_name: str
+    ) -> None:
+        skill = load_skill_catalog().get(skill_name)
+        assert skill is not None
+        loop, llm = _loop([LLMResponse(content="你好！")])
+        dialogue = _dialogue(object())
+
+        events = await _collect(dialogue.stream_agent_reply(loop, "你好", skill=skill))
+
+        assert [event.type for event in events] == ["final"]
+        assert len(llm.calls) == 1
+        call = llm.calls[0]
+        system = call["messages"][0]["content"]
+        # Shared persona must not turn every role into a motivational interview.
+        assert "请使用苏格拉底式对话风格" not in system
+        assert "简单问题直接用一两句话答清楚" in system
+        assert "复杂任务按需要充分分析" in system
+        assert "无需每次附带追问" in system
+        assert "不嘲讽或评判问题难易" in system
+        assert "无需为补充背景而查询画像或记忆" in system
+        assert "寒暄或致谢只用一句自然回应" in system
+        assert "不自我介绍、罗列功能或另起话题" in system
+        assert "简单事实直接给结果" in system
+        assert "一句话只讲必要要点" in system
+        assert "不用长串逗号、括号堆成伪短答" in system
+        assert "除非用户要求，不展示内部置信度、权重等数据" in system
+        # Skill-specific interviews and write/approval rules remain authoritative.
+        assert skill.system_prompt in system
+        if skill_name == "taste-explorer":
+            assert "苏格拉底式的追问" in system
+        # Proportionality is inferred in the existing completion, without a
+        # classifier call or a reduced budget that could truncate hard tasks.
+        assert call["max_tokens"] == 4096
+        assert call["reasoning_effort"] is None
+        assert call["tools"]
 
 
 async def test_agent_context_isolated_per_conversation() -> None:

@@ -73,7 +73,11 @@ Phase 2 cognition rollout 在配置 API 中也是 task-scoped：`soul` GET/PUT �
 
 聊天批准后的 `update_config` 同样通过 API 的 `config_update_hook(key, value)` 进入这条队列：在保存锁内加载最新磁盘配置、应用单字段补丁、校验并快照，再等待该修订的实际应用结果。成功更新同一 last-good 基线；失败回滚并将审批置为 failed，不提前改 live Config，也不把热重载失败报告成执行成功。尚未开始的聊天修订被后续保存替代时，会明确报告被替代。
 
+若完整候选配置只改变 `[agent]` 的 `loop_enabled`、`loop_max_steps`、`tool_result_max_chars`、`session_title_enabled`、`task_max_steps` 五个已确认独立的字段，队列在同一 reload lock 内调用 `RuntimeContext.try_apply_agent_config()`，替换聊天 loop 与配置引用；LLM service、工具、审批存储、画像和对话学习 owner 保持原实例，不暂停、排空或取消后台任务。在途回合保留旧 loop/预算，新回合使用新值。完整候选与当前配置严格相等时直接完成修订，连 loop 也不替换。该路径仍更新 last-good、完成审批 future 并广播 `config_reloaded`。含其他未应用字段、未来新增 agent 字段变化、降级运行时或需要重启的修订均走原完整 handoff。
+
 热重载按审批文件的规范路径复用原 `ApprovalStore`；项目相对路径或符号链接别名变化不会重建同文件的内存状态机，正在执行的批准仍由原任务结算为 `executed/failed`，重复批准不重新入队。
+
+局部应用资格仅由上述五个键的聊天审批授予。普通 `PUT /api/config` 仍完整重载，因为 Cookie 等独立文件可能改变而 `Config` 值不变；普通修订尚未执行就被合并，或执行失败后由新修订接替时，其完整重建要求继续传递，不会被后续聊天设置覆盖。
 
 后台配置应用队列为 app-owned、latest-wins：正在应用的修订不会被取消，尚未开始的多个修订会合并为最新一份；因为每次 PATCH 都基于最新已落盘配置构建，合并不会丢掉前一轮已保存字段。成功广播 `config_reloaded`；失败且没有更新修订等待时恢复最后一次已生效配置并广播 `config_reload_failed`，若已有更新修订则不回滚覆盖它，直接继续应用最新值。进程在排队期间退出也不会丢配置，下一次启动直接从已落盘 `config.toml` 构建运行时。
 

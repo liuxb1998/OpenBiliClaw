@@ -521,6 +521,7 @@ class _QueuedConfigApply:
     run_post_reload_llm_work: bool
     restart_required: bool = False
     completion: asyncio.Future[str] | None = None
+    allow_agent_live_apply: bool = False
 
 
 # Guided-init owner-lease heartbeat period. A stage can spend minutes inside one
@@ -2039,6 +2040,7 @@ def create_app(
 ) -> FastAPI:
     """Create the local backend API app."""
     from openbiliclaw.api.runtime_context import (
+        _LIVE_AGENT_CONFIG_FIELDS,
         RuntimeContext,
         build_degraded_runtime_context,
         build_runtime_context,
@@ -3428,6 +3430,18 @@ def create_app(
 
     async def _apply_runtime_config_revision(item: _QueuedConfigApply) -> str:
         """Apply one persisted revision without owning the config-file lock."""
+        # Chat knobs have no dependency on profile/feedback owners. Keep the
+        # same queue, lock and last-good transaction, but don't drain unrelated
+        # work when the complete candidate differs only in known chat fields.
+        if item.allow_agent_live_apply and not item.restart_required:
+            async with config_runtime_reload_lock:
+                if ctx.try_apply_agent_config(item.config):
+                    logger.info(
+                        "Chat config applied without runtime rebuild: revision=%d", item.revision
+                    )
+                    return (
+                        f"配置已保存到 {item.saved_path}。聊天设置已生效，正在进行的任务继续执行。"
+                    )
         was_degraded = bool(getattr(ctx, "degraded", False))
         recovered_from_degraded = False
 
@@ -3527,6 +3541,13 @@ def create_app(
                     error = _config_reload_error(exc)
                     async with _CONFIG_SAVE_LOCK:
                         if config_apply_pending is not None:
+                            # A failed ordinary settings revision may have
+                            # persisted credentials outside Config; its next
+                            # revision must still rebuild those consumers.
+                            config_apply_pending.allow_agent_live_apply = (
+                                config_apply_pending.allow_agent_live_apply
+                                and item.allow_agent_live_apply
+                            )
                             _set_config_apply_status(
                                 "queued",
                                 (
@@ -3622,6 +3643,12 @@ def create_app(
     def _enqueue_config_apply(item: _QueuedConfigApply) -> None:
         nonlocal config_apply_pending, config_apply_task
         if config_apply_pending is not None:
+            # Ordinary settings can update external cookie jars without any
+            # Config field changing. Coalescing must retain their rebuild
+            # requirement even when the newest revision is a small agent edit.
+            item.allow_agent_live_apply = (
+                item.allow_agent_live_apply and config_apply_pending.allow_agent_live_apply
+            )
             _settle_config_completion(
                 config_apply_pending, error="配置修改已被更新的修订替代，请检查当前设置。"
             )
@@ -3675,6 +3702,9 @@ def create_app(
                     saved_path=saved_path,
                     run_post_reload_llm_work=False,
                     completion=completion,
+                    allow_agent_live_apply=(
+                        key.startswith("agent.") and key[6:] in _LIVE_AGENT_CONFIG_FIELDS
+                    ),
                 )
             )
         return await asyncio.shield(completion)

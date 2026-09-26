@@ -1521,6 +1521,21 @@ body.chat-view-active .back-to-top {
   background: var(--surface-strong);
 }
 
+.chat-pending[hidden] { display: none; }
+
+/* Keep the conversation and composer inside the keyboard's visual viewport.
+   Pending approvals stay reachable; only shell navigation is folded away. */
+body.chat-view-active.chat-keyboard-active {
+  position: fixed;
+  top: var(--chat-visible-top, 0px);
+  height: var(--chat-visible-height, 100%);
+}
+body.chat-view-active.chat-keyboard-active #status-bar,
+body.chat-view-active.chat-keyboard-active #tab-bar { display: none; }
+body.chat-view-active.chat-keyboard-active #app { padding-top: 6px; }
+body.chat-view-active.chat-keyboard-active .chat-pending { max-height: 28%; }
+body.chat-view-active.chat-keyboard-active .chat-input { max-height: 88px; min-height: 44px; }
+
 .chat-pending-toggle {
   flex: 0 0 auto;
   width: 100%;

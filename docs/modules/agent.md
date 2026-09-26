@@ -213,10 +213,11 @@ source=builtin|custom）与 `SkillCatalog`（`get` / `default` /
 **会话绑定与切换**：`POST /api/chat/agent/stream` 请求体新增可选 `skill`
 字段（空 = 默认口味伙伴，未知名返回 422）。选中 skill 后：loop 的工具集 =
 `agent_tool_registry.subset(skill.tools)` + `suggest_skill` 元工具；system
-prompt = 基础 socratic 人设 ⊕ skill 人设 ⊕ 其他 skill 清单
+prompt = 按当前请求调整深度的共享聊天人设 ⊕ skill 人设 ⊕ 其他 skill 清单
 （`_layer_skill_system_prompt()`，dialogue.py）⊕ **Agent 工作纪律**
 （`_AGENT_LOOP_GROUND_RULES`，所有 skill 共享的三条硬约束：① 工具纪律——
-需要数据必须实际发起 tool_call，严禁在正文描述/编造工具调用与结果，没调
+已有对话足以回答时无需为补充背景查询画像或记忆，仅查必要数据并复用本轮结果；
+需要查询或修改数据必须实际发起 tool_call，严禁在正文描述/编造工具调用与结果，没调
 工具就不得声称查过/改过；② 记忆归属——记忆/画像/历史来自跨会话共享底座，
 无明确依据不得断言行事发生在本对话；③ 会话边界——「本对话/第一回合」指
 当前会话，上下文窗口只是当前会话近期）。会话中切换就是下一回合带
@@ -224,6 +225,14 @@ prompt = 基础 socratic 人设 ⊕ skill 人设 ⊕ 其他 skill 清单
 （`agent/tools/skill_tools.py`）：模型输出工具调用（`skill` + `reason`），
 前端把该 `tool_call` 事件渲染成切换卡片，用户确认后以下一回合的 `skill`
 字段生效——agent 自身不能切换。skill 列表见 `GET /api/chat/skills`。
+
+共享聊天人设由 `build_socratic_dialogue_prompt(..., socratic=False)` 提供：简单问题
+直接答清楚，寒暄/致谢一句结束，简单事实给结果；尊重用户指定长度，每句只保留必要要点，
+不把长串逗号/括号当作简答。摘要默认不输出内部置信度/权重，但保留影响结论的不确定性；
+复杂任务充分分析并执行必要步骤。澄清只针对影响
+正确性/执行的缺口或当前访谈角色的探索需求，不给每个角色叠加无条件的苏格拉底追问。
+`taste-explorer` 自身的访谈职责不变。此调整在原有模型调用中生效，没有关键词路由
+或额外分类调用，不降低工具、步数、输出 token 或实例 reasoning 预算。
 
 ### 服务层入口
 

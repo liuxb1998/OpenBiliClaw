@@ -355,7 +355,7 @@ class SocraticDialogue:
         Shares the legacy single-hop path's persona and post-reply learning,
         with conversation-local history when ``session_id`` is supplied.
         The user turn is appended before the loop runs
-        (rolled back on failure), the socratic system prompt becomes the
+        (rolled back on failure), the shared adaptive chat prompt becomes the
         loop's system instruction, and the completed exchange is recorded
         and queued for learning exactly like ``respond``. The dialogue lock
         is held for the whole run so learning stays serialized with the
@@ -363,9 +363,10 @@ class SocraticDialogue:
         target in both the model prompt and the queued learning job.
 
         With ``skill`` (M4), the skill's persona prompt and the
-        ``skill_switch_guide`` block are layered on top of the base socratic
+        ``skill_switch_guide`` block are layered on top of the shared chat
         system prompt, and ``tools`` (the skill's whitelist subset plus meta
-        tools) overrides the loop's registry for this run.
+        tools) overrides the loop's registry for this run. Interview-style
+        follow-up questions belong to the selected skill, not every chat.
 
         M7: ``session`` / ``session_id`` / ``turn_id`` are forwarded as the
         loop's approval context so parked hard_write approvals can be traced
@@ -412,6 +413,7 @@ class SocraticDialogue:
                     tone_profile=tone_profile,
                     reply_style=str(getattr(service, "reply_style", "") or ""),
                     dialogue_tone_prompt=str(getattr(service, "dialogue_tone_prompt", "") or ""),
+                    socratic=False,
                 )
                 system = prompt_messages[0]["content"] if prompt_messages else ""
                 if skill is not None:
@@ -728,7 +730,7 @@ def _layer_skill_system_prompt(
     *,
     skill_switch_guide: str = "",
 ) -> str:
-    """Layer a chat skill's persona prompt on top of the base socratic prompt.
+    """Layer a chat skill's persona prompt on top of the shared chat prompt.
 
     The base prompt keeps the shared 阿b persona and tone; the skill block
     narrows the role (人设 + 可用数据/工具入口声明) for this session, and the
@@ -751,7 +753,9 @@ def _layer_skill_system_prompt(
 # models follow fewer, sharper rules better than long instruction lists.
 _AGENT_LOOP_GROUND_RULES = (
     "【工作纪律（最高优先级，必须严格遵守）】\n"
-    "1. 工具纪律：需要查询或修改任何数据时，必须实际发起工具调用（tool_call）。"
+    "1. 工具纪律：已有对话足以回答当前问题时，无需为补充背景而查询画像或记忆；"
+    "仅查询完成请求所需的数据，本轮已有工具结果可以复用，需要更新或核实时再查。"
+    "需要查询或修改数据时，必须实际发起工具调用（tool_call）。"
     "严禁只在回复正文里声称「我来查一下」「已查到」「已改好」而没有真的调用工具，"
     "严禁编造工具调用过程或结果。没有实际调用工具，就不得声称查过或改过。\n"
     "2. 记忆归属：你能读到的记忆、画像和历史来自跨会话共享的记忆底座，"

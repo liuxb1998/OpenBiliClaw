@@ -27,6 +27,7 @@
 | 2.2 Provider Registry | ✅ | 多端点实例注册 + 全局 / 模块有序链 + 实例级 cooldown + health check |
 | v0.3.x 原生 function calling（M1） | ✅ | `OpenAIProvider.complete_with_tools()` 走 OpenAI `tools=[{"type":"function",...}]` 原生 FC，支持单次响应多个 `tool_calls` 并行解析；`api_flavor="responses"` 实例与 Ollama 显式标 `supports_tool_calling=False`，由 service 层 prompt 模拟兜底；DeepSeek 继承原生 FC 并保留 thinking max_tokens 下限；`LLMRegistry.complete_with_tools*()` 复用 fallback 链 cooldown / 限流语义，链内跳过无 FC 能力的实例 |
 | 2.3 Prompt 管理与 Service | ✅ | Prompt 构建器 + LLMService 门面 |
+| Agent 聊天按需深度 | ✅ | `build_socratic_dialogue_prompt(..., socratic=False)` 让简单问题简答、复杂任务充分展开，访谈追问由所选 skill 负责；不新增分类调用，不覆盖实例 reasoning 或压低输出预算。默认 `True` 保持旧对话风格 |
 | 画像整理裁决 prompt | ✅ | `build_profile_consolidation_prompt()` 保持静态 system + 确定性 user JSON；likes 从“仅严格同义”调整为“是否重复占用同一推荐意图”，允许合并“搞笑 / 娱乐搞笑”这类无新增选择价值的同粒度标签，同时明确保留“篮球 / NBA”“AI技术 / AI视频技术”等会改变召回范围的父子兴趣。每个簇携带 `known_distinct_pairs`，模型不得重判或合并用户回滚 / 当前策略已确认分开的 pair；代码侧仍作相同约束的强校验。dislikes 继续只合并近乎同义项并严禁向上泛化 |
 | Phase 2 provider-independent cognition views | ✅ | Preference、plain Awareness、Awareness-with-confusions 与 Insight builder 都有显式 `input_view="legacy"|"compact-v1"` seam；compact 使用 `CognitionEventViewV1` 与 `CognitionProfileViewV1` 删除 transport/storage 重复字段并按 stable soul → stable preference → volatile cognition → current batch 排序，system message、输出 schema、reasoning 和 token ceiling 不变。生产 rollout 逐 task 控制：只默认开启已通过 SenseTime 门的 `soul.awareness_confusions`，plain `soul.awareness` 固定 legacy，Preference/Insight 默认 legacy。该投影不依赖 tokenizer、模型或 provider cache。 |
 | v0.3.182+ 对话洞察锚 prompt | ✅ | `build_dialogue_insight_prompt(..., active_list=None, anchor=None)` 保持模块级静态 system 与确定性 `sort_keys=True` user JSON。`anchor=None` 保留无锚字节形态；非空 `anchor` 只在 user message 追加 `<current_anchor>` 与 kind×relation 输出契约，不把代次数据污染 prompt-cache system 前缀。 |
@@ -107,6 +108,15 @@
 `l2_cache_stats()` 把 L2 持久化缓存暴露给诊断与维护面（CLI 清理等），namespace 注册保持一致。
 
 ## 公开 API
+
+`build_socratic_dialogue_prompt(..., socratic=True)` 继续提供共享朋友人设、用户语气与
+能力边界。`socratic=False` 仅把无条件的苏格拉底追问替换为按当前请求调整深度的规则，
+供 agent 聊天使用：寒暄/致谢一句自然结束，简单事实给结果；按指定句数提炼必要要点，
+默认不输出内部置信度/权重等数据，不用长串逗号/括号绕过简答要求。复杂分析和影响结论的
+不确定性仍充分表达。history、core-memory seam、`reply_style` 和
+`dialogue_tone_prompt` 的注入/替换语义不变。选定的 skill 仍可声明访谈职责。
+历史消息的时间标签用于理解上下文，不作为自动回复前缀；询问时间仍正常回答。
+此约束仅在 adaptive prompt 中声明，不删除或正则清洗模型输出，旧默认风格保持。
 
 `OpenAIProvider.complete(..., json_mode=True)` 在 Responses flavor 下确保 `input` 消息包含大小写不敏感的 `json` 标记；缺失时追加 `Return valid json.` user 指令。调用方消息和 `instructions` 缓存前缀不变，已有 JSON 输入和普通文本调用保持原样。连接测试仍表示普通文本连通性，不承诺所有结构化任务成功。
 

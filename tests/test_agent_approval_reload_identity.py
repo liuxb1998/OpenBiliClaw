@@ -43,8 +43,8 @@ async def test_config_approval_stays_executed_across_data_path_normalization(
     assert original_store.path.resolve() == project / "data" / "chat_approvals.json"
     approval = original_store.submit(
         tool_name="update_config",
-        arguments={"key": "agent.loop_max_steps", "value": "63"},
-        summary="Update chat step budget",
+        arguments={"key": "language", "value": "en-US"},
+        summary="Update language through a complete runtime rebuild",
     )
 
     async with httpx.AsyncClient(

@@ -18,6 +18,10 @@ gate 属于 `RuntimeContext` 的稳定部分：热重载构造成功后在同一
 
 ## 已实现功能
 
+已知聊天配置局部应用：配置队列只在完整候选差异限于已知五项 agent 字段时替换 loop，保留所有后台 owner；严格相等的配置直接完成修订。白名单外差异仍安全排空后完整重建。
+
+资格来自显式聊天配置审批；普通设置保存保持完整重载，以应用 Cookie jar 等配置对象外的变化。合并 pending 修订或接替失败修订时保留完整重建要求。
+
 | 功能 | 状态 | 说明 |
 |------|------|------|
 | 应用内 Tailnet helper supervisor | ✅ | `[tailnet].enabled=true` 时，`start` / `serve-api` / 冻结桌面入口发现并托管独立 Go `tsnet` helper；节点状态写 `data/tailnet/`，Auth Key 从父环境取出后只经 stdin bootstrap 传入。JSONL 事件脱敏后原子写 `status.json` 并驱动首次浏览器登录 / ready 提示；关闭先 EOF、再有界 terminate/kill。helper 固定反代 `127.0.0.1:<当前入口有效端口>`，显式 `--port` 或桌面 `OPENBILICLAW_PORT` 可覆盖磁盘 `api.port`；远程入口失败不阻止本机 API。构建固定省略 logtail / Web UI，macOS 12 以下只降级此 helper。 |
@@ -122,6 +126,8 @@ RuntimeContext 重建 RecommendationEngine 时透传视觉开关、帧数、两�
 后新 embedding provenance 会重新筛选待处理池。
 
 ## 公开 API
+
+`RuntimeContext.try_apply_agent_config(config) -> bool` 是配置队列在 reload lock 内使用的同步发布入口：仅允许已知五项聊天配置差异（详见 [配置模块](config.md)），构造新 `AgentLoop` 后同步更新 runtime/tool-context 配置引用。完整候选严格相等时不替换任何组件并返回成功。在途 loop、LLM service、工具、审批 store、画像与学习队列均保留；其他差异返回 `False`，由调用方继续原完整 handoff。成功仍由原队列维护 last-good、修订号和事件通知。
 
 ### Tailnet helper lifecycle
 

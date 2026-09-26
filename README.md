@@ -642,6 +642,8 @@ OpenClaw 收到 `interest.probe` 事件（或主动拉取 `next-probe`），发�
 
 聊一聊：`持久化 turn → API 持有的 agent 执行任务 → 会话上下文 + 工具 → 事件落库 / SSE → 回复完成`；HTTP 断连后原执行继续，完成的 turn 重试直接回放。
 
+配置应用：`保存 / 批准 → 同一应用队列 → 已知聊天设置局部替换 loop，其他配置安全排空后重建`；局部更新保留正在执行的聊天与学习任务。
+
 完整的架构总览 ASCII 图（runtime 并发闸门、Agent 编排层、多源适配、发现 / 推荐 / 保存链路）已拆分到单独文档，避免 README 过长：
 
 发布日期偏好：`[sources.<name>].recommendation_date_*` 按来源配置 → 发现阶段 LLM 评估前硬过滤范围外候选 → 有效库存 → PoolCurator → 范围外软降分 / 严格 serving 忽略（候选保留）；严格模式下推 B 站搜索边界

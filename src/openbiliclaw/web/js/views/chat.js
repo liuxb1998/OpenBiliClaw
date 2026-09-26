@@ -63,7 +63,7 @@ import {
   buildContentUrl,
 } from "../view-models.js";
 import { openContentUrl } from "../app-launch.js";
-import { state, patchState } from "../state.js";
+import { state, patchState, subscribe } from "../state.js";
 
 const dialogueConfirmation = globalThis.OpenBiliClawDialogueConfirmation;
 if (!dialogueConfirmation) {
@@ -128,6 +128,7 @@ let historyRefreshTimer = null;
 let historyRefreshInFlight = false;
 let historyRefreshGeneration = 0;
 let visibilityResumeBound = false;
+let chatViewportBound = false;
 let lastHistorySignature = null;
 let pendingConfirmationRefreshTimer = null;
 let dialogueStatus = { message: "", tone: "info" };
@@ -1032,6 +1033,33 @@ function renderAgentOverlays() {
   }
 }
 
+// Keep the live composer attached while rebuilding history and cards. Removing
+// a focused textarea resets selection, scroll and IME composition on mobile.
+function mountChatShell(root, shell) {
+  const previousShell = root.querySelector(".chat-shell");
+  const previousRow = previousShell?.querySelector(".chat-input-row");
+  const previousInput = previousRow?.querySelector("#chat-input");
+  const nextRow = shell.querySelector(".chat-input-row");
+  const nextInput = nextRow?.querySelector("#chat-input");
+  if (!previousShell || !previousRow || !previousInput || !nextInput) {
+    root.replaceChildren(shell);
+    return nextInput;
+  }
+  if (previousInput.value !== nextInput.value) previousInput.value = nextInput.value;
+  previousInput.placeholder = nextInput.placeholder;
+  previousRow.querySelector("#chat-send").disabled = nextRow.querySelector("#chat-send").disabled;
+  for (const child of [...previousShell.children]) {
+    if (child !== previousRow) child.remove();
+  }
+  let afterComposer = false;
+  for (const child of [...shell.children]) {
+    if (child === nextRow) afterComposer = true;
+    else if (afterComposer) previousShell.appendChild(child);
+    else previousShell.insertBefore(child, previousRow);
+  }
+  return previousInput;
+}
+
 function render() {
   if (!$root) return;
   const approvalDrafts = captureApprovalDrafts($root);
@@ -1046,7 +1074,6 @@ function render() {
     ? previousInput.value || retainedDraft
     : retainedDraft;
   const restoreInputFocus = document.activeElement === previousInput;
-  $root.innerHTML = "";
 
   const shell = document.createElement("div");
   shell.className = "chat-shell";
@@ -1155,7 +1182,7 @@ function render() {
   const inputRow = document.createElement("div");
   inputRow.className = "chat-input-row";
 
-  const textarea = document.createElement("textarea");
+  let textarea = document.createElement("textarea");
   textarea.className = "chat-input";
   textarea.id = "chat-input";
   textarea.placeholder = PLACEHOLDERS[placeholderIdx];
@@ -1199,7 +1226,8 @@ function render() {
   status.hidden = !dialogueStatus.message;
   shell.appendChild(status);
 
-  $root.appendChild(shell);
+  textarea = mountChatShell($root, shell);
+  autoGrow({ target: textarea });
   restoreApprovalDrafts($root, approvalDrafts);
 
   for (const details of messages.querySelectorAll(".dialogue-evidence")) {
@@ -1218,7 +1246,7 @@ function render() {
       Math.max(0, messages.scrollHeight - messages.clientHeight),
     );
   }
-  if (restoreInputFocus) {
+  if (restoreInputFocus && document.activeElement !== textarea) {
     requestAnimationFrame(() => textarea.focus({ preventScroll: true }));
   }
 
@@ -1246,10 +1274,6 @@ function startPlaceholderCarousel() {
       input.placeholder = PLACEHOLDERS[placeholderIdx];
     }
   }, 4000);
-}
-
-function isChatMessagesNearBottom(messages) {
-  return messages.scrollHeight - messages.scrollTop - messages.clientHeight <= 48;
 }
 
 function chatHistorySignature(nextTurns) {
@@ -1281,6 +1305,7 @@ function finalizeAgentTurn(turnId, { reply = "", error = "" } = {}) {
       t.error = error;
     } else {
       t.status = "completed";
+      t.reply = reply;
       t.response = reply;
     }
   }
@@ -1292,7 +1317,6 @@ async function finalizeAgentTurnSuccess(turnId, reply) {
   const sessionId = agentRunsByTurnId.get(turnId)?.sessionId;
   finalizeAgentTurn(turnId, { reply });
   if (sessionId && sessionId !== activeSessionId) return;
-  userScrolledUp = false;
   setDialogueStatus("这句已经记下了。", "success");
   render();
   void Promise.allSettled([
@@ -1414,6 +1438,8 @@ async function handleSend() {
   turns.push({
     turn_id: turnId,
     session_id: sessionId,
+    scope: "chat",
+    created_at: new Date().toISOString(),
     message: text,
     response: null,
     status: "pending",
@@ -1846,10 +1872,6 @@ async function loadHistory() {
   historyRefreshInFlight = true;
   const sessionId = activeSessionId;
   const generation = ++historyRefreshGeneration;
-  const existingMessages = document.getElementById("chat-messages");
-  const shouldStickToBottom =
-    !(existingMessages instanceof HTMLElement) || isChatMessagesNearBottom(existingMessages);
-  const previousScrollTop = existingMessages instanceof HTMLElement ? existingMessages.scrollTop : 0;
   try {
     const [historyResult, pendingResult, approvalsResult] = await Promise.allSettled([
       fetchChatSessionDetail(sessionId, { limit: 100 }).catch(async (error) => {
@@ -1913,17 +1935,9 @@ async function loadHistory() {
     const firstLoad = !historyLoaded;
     historyLoaded = true;
     if (!changed && !firstLoad) return;
+    // render captures the current reading position. A snapshot taken before
+    // awaiting history would undo any scrolling or Send action during fetch.
     render();
-    if (!shouldStickToBottom) {
-      window.requestAnimationFrame(() => {
-        const messages = document.getElementById("chat-messages");
-        if (!(messages instanceof HTMLElement)) return;
-        messages.scrollTop = Math.min(
-          previousScrollTop,
-          Math.max(0, messages.scrollHeight - messages.clientHeight),
-        );
-      });
-    }
   } catch {
     // Keep the last durable snapshot while offline.
   } finally {
@@ -1957,6 +1971,36 @@ function bindVisibilityResume() {
     if (document.hidden) return;
     if (state.activeTab !== "chat" || !state.online) return;
     void loadHistory();
+  });
+}
+
+function syncChatViewport() {
+  const viewport = window.visualViewport;
+  const height = viewport?.height || window.innerHeight;
+  const focused = Boolean(document.activeElement?.matches(
+    ".chat-input, .agent-overlay-host input, .agent-overlay-host textarea",
+  ));
+  // A 400px viewport left only 14px for history in the mobile acceptance run.
+  // Compact focused small windows too; a >100px visual/layout gap also covers
+  // Safari keyboards that resize visualViewport without resizing the layout.
+  const occluded = document.documentElement.clientHeight - height > 100;
+  const compact = state.activeTab === "chat" && (viewport?.scale || 1) === 1
+    && (occluded || (focused && height <= 500));
+  document.body.classList.toggle("chat-keyboard-active", compact);
+  document.body.style.setProperty("--chat-visible-height", `${height}px`);
+  document.body.style.setProperty("--chat-visible-top", `${viewport?.offsetTop || 0}px`);
+}
+
+function bindChatViewport() {
+  if (chatViewportBound) return;
+  chatViewportBound = true;
+  window.visualViewport?.addEventListener("resize", syncChatViewport);
+  window.visualViewport?.addEventListener("scroll", syncChatViewport);
+  window.addEventListener("resize", syncChatViewport);
+  document.addEventListener("focusin", syncChatViewport);
+  document.addEventListener("focusout", () => requestAnimationFrame(syncChatViewport));
+  subscribe((_state, changed) => {
+    if ("activeTab" in changed) syncChatViewport();
   });
 }
 
@@ -2007,6 +2051,8 @@ export function initChatView(root) {
   $root = root;
   startChatHistorySync();
   bindVisibilityResume();
+  bindChatViewport();
+  syncChatViewport();
   if (!loaded) {
     loaded = true;
     loadNotifications();
