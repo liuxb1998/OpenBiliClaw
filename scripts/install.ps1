@@ -642,7 +642,7 @@ print(f"SERVICE_ERRORS={' | '.join(service_errors)}")
         Write-Host 'Next steps (credentials are missing):'
         Write-Host ''
         Write-Host '  1. Choose your LLM chat provider (default: deepseek):'
-        Write-Host '     Supported: deepseek | openai | gemini | claude | openrouter | requesty | openai_compatible'
+        Write-Host '     Supported: deepseek | openai | gemini | claude | openrouter | requesty | api_route | openai_compatible'
         Write-Host '     (Local Ollama is embedding-only here - not offered as a chat provider.)'
         Write-Host ''
         if ($missing -match 'api_key') {
@@ -653,6 +653,7 @@ print(f"SERVICE_ERRORS={' | '.join(service_errors)}")
             Write-Host '         Claude:     https://console.anthropic.com/settings/keys'
             Write-Host '         OpenRouter: https://openrouter.ai/keys'
             Write-Host '         Requesty:   https://app.requesty.ai/api-keys'
+            Write-Host '         API Route:  https://global.api-route.com/'
             Write-Host ''
         }
         if ($missing -match 'bilibili.cookie') {

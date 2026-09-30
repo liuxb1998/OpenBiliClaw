@@ -1,5 +1,6 @@
 """LLM package — multi-model provider support."""
 
+from .api_route_provider import ApiRouteProvider
 from .base import (
     HealthCheckResult,
     LLMAuthError,
@@ -35,6 +36,7 @@ from .service import (
 )
 
 __all__ = [
+    "ApiRouteProvider",
     "ClaudeProvider",
     "DeepSeekProvider",
     "GeminiProvider",

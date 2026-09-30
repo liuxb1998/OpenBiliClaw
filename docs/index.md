@@ -23,6 +23,7 @@
 
 - [项目规格说明书 (SPEC)](spec.md) — 完整的项目设计与规划
 - [架构设计](architecture.md) — 系统架构与模块关系
+- [推荐导演三模式设计](plans/2026-09-26-director-jev-modes.md) / [Jev 官方研究](plans/2026-09-26-jev-provider-research.md) / [基础规格](plans/2026-08-31-recommendation-director-spec.md) — 逐对编排、Agent+Jev 局部修正、纯 Agent 与独立过滤 provider；设计阶段，尚未实现
 - [架构总览图](architecture-overview.md) / [English](architecture-overview.en.md) — 从 README 拆出的 ASCII 架构总览：runtime 并发闸门、Agent 编排层、多源适配与发现/推荐/保存链路
 - [记忆系统设计](memory-design.md) — 多层网状记忆架构详解
 - [v0.1 开发任务清单](v0.1-todolist.md) — 当前版本的开发主线

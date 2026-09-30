@@ -43,6 +43,18 @@ _BILLING_BACKOFF_MARKERS = (
 if TYPE_CHECKING:
     from collections.abc import Awaitable, Callable
 
+# A reasoning-first endpoint can burn the entire output budget on invisible
+# thinking and finish truncated — ``finish_reason=length`` on chat
+# completions, ``status="incomplete"`` with
+# ``incomplete_details.reason="max_output_tokens"`` on the Responses API —
+# either with empty ``content`` or with a JSON payload truncated mid-stream.
+# Retrying with the same budget cannot succeed, so ``complete()`` reissues
+# the request once with a doubled budget, capped here to stay within common
+# provider ceilings (DeepSeek documents 64K; many gateways reject anything
+# above 32K).
+_LENGTH_FINISH_REASONS = frozenset({"length", "max_tokens"})
+_LENGTH_RETRY_MAX_TOKENS_CAP = 32768
+
 
 class _NonRetryableRequestError(LLMProviderError):
     """A request/configuration failure that cannot heal through immediate retry."""
@@ -191,6 +203,19 @@ class OpenAIProvider(LLMProvider):
                 raise
         choice = response.choices[0]
         content = choice.message.content or ""
+        if json_mode and content.strip() and self._length_truncated(choice):
+            # The model was cut off mid-JSON by the output cap; the partial
+            # payload is unparseable for structured callers. Retry once with
+            # a doubled budget instead of handing truncated text downstream.
+            retried = await self._retry_with_larger_budget(
+                kwargs,
+                max_tokens=max_tokens,
+                send=lambda kw: self._chat_request_with_temperature_compat(**kw),
+            )
+            if retried is not None:
+                response, max_tokens = retried
+                choice = response.choices[0]
+                content = choice.message.content or ""
         if not content.strip():
             # Some OpenAI-compatible backends return HTTP 200 and report
             # completion_tokens > 0, yet ``message.content`` is empty when
@@ -231,6 +256,21 @@ class OpenAIProvider(LLMProvider):
                 response = await self._chat_request_with_temperature_compat(**kwargs)
                 choice = response.choices[0]
                 content = choice.message.content or ""
+            if not content.strip() and self._length_truncated(choice):
+                # A reasoning-first endpoint spent the whole budget on thinking
+                # and returned reasoning-only output; only a larger budget lets
+                # the final answer through. This is the generic recovery for
+                # callers that keep the provider's configured effort (e.g. the
+                # keyword planner's merged generation).
+                retried = await self._retry_with_larger_budget(
+                    kwargs,
+                    max_tokens=max_tokens,
+                    send=lambda kw: self._chat_request_with_temperature_compat(**kw),
+                )
+                if retried is not None:
+                    response, max_tokens = retried
+                    choice = response.choices[0]
+                    content = choice.message.content or ""
             if not content.strip():
                 raise self._empty_content_error(choice)
 
@@ -434,18 +474,48 @@ class OpenAIProvider(LLMProvider):
 
         response = await self._responses_request_dropping_rejected_temperature(kwargs)
         content = self._responses_output_text(response)
-        if not content.strip() and json_mode and "text" in kwargs:
-            # Same backend quirk as the chat-completions path: HTTP 200 with
-            # empty content when an output-format constraint is set. The
-            # prompt already demands JSON, so drop the constraint and retry.
-            logger.warning(
-                "%s returned empty content with text.format=json_object; "
-                "retrying without the format constraint",
-                self._provider_name,
+        if json_mode and content.strip() and self._responses_output_truncated(response):
+            # The model was cut off mid-JSON by the output cap; the partial
+            # payload is unparseable for structured callers. Retry once with
+            # a doubled budget instead of handing truncated text downstream.
+            retried = await self._retry_with_larger_budget(
+                kwargs,
+                max_tokens=max_tokens,
+                send=self._responses_request_dropping_rejected_temperature,
+                budget_key="max_output_tokens",
+                truncation="status=incomplete (max_output_tokens)",
             )
-            kwargs.pop("text")
-            response = await self._responses_request_dropping_rejected_temperature(kwargs)
-            content = self._responses_output_text(response)
+            if retried is not None:
+                response, max_tokens = retried
+                content = self._responses_output_text(response)
+        if not content.strip():
+            if json_mode and "text" in kwargs:
+                # Same backend quirk as the chat-completions path: HTTP 200
+                # with empty content when an output-format constraint is set.
+                # The prompt already demands JSON, so drop the constraint and
+                # retry.
+                logger.warning(
+                    "%s returned empty content with text.format=json_object; "
+                    "retrying without the format constraint",
+                    self._provider_name,
+                )
+                kwargs.pop("text")
+                response = await self._responses_request_dropping_rejected_temperature(kwargs)
+                content = self._responses_output_text(response)
+            if not content.strip() and self._responses_output_truncated(response):
+                # A reasoning-first model spent the whole output budget on
+                # thinking and the response stayed incomplete; only a larger
+                # budget lets the final answer through.
+                retried = await self._retry_with_larger_budget(
+                    kwargs,
+                    max_tokens=max_tokens,
+                    send=self._responses_request_dropping_rejected_temperature,
+                    budget_key="max_output_tokens",
+                    truncation="status=incomplete (max_output_tokens)",
+                )
+                if retried is not None:
+                    response, max_tokens = retried
+                    content = self._responses_output_text(response)
         if not content.strip():
             raise LLMResponseError(f"{self._provider_name} returned empty content")
 
@@ -863,6 +933,61 @@ class OpenAIProvider(LLMProvider):
         """
         del reasoning_effort
         return {}
+
+    @staticmethod
+    def _length_truncated(choice: Any) -> bool:
+        """Whether the choice was cut off by the output-token cap."""
+        return str(getattr(choice, "finish_reason", "") or "") in _LENGTH_FINISH_REASONS
+
+    @staticmethod
+    def _responses_output_truncated(response: Any) -> bool:
+        """Whether a Responses payload was cut off by the output-token cap.
+
+        The Responses API signals output truncation with
+        ``status="incomplete"`` and
+        ``incomplete_details.reason="max_output_tokens"``.
+        """
+        if str(getattr(response, "status", "") or "") != "incomplete":
+            return False
+        details = getattr(response, "incomplete_details", None)
+        reason = getattr(details, "reason", None)
+        if reason is None and isinstance(details, dict):
+            reason = details.get("reason")
+        return str(reason or "") == "max_output_tokens"
+
+    async def _retry_with_larger_budget(
+        self,
+        kwargs: dict[str, Any],
+        *,
+        max_tokens: int,
+        send: Callable[[dict[str, Any]], Awaitable[Any]],
+        budget_key: str = "max_tokens",
+        truncation: str = "finish_reason=length",
+    ) -> tuple[Any, int] | None:
+        """Reissue a length-truncated request once with a doubled output budget.
+
+        ``budget_key`` is ``max_tokens`` for chat completions and
+        ``max_output_tokens`` for the Responses API; ``truncation`` is the
+        wire-level truncation marker for the log line. Returns
+        ``(response, new_max_tokens)`` when a retry was sent, or ``None``
+        when the budget is already at the cap (a retry would send the same
+        request). ``kwargs`` is updated in place so any later retry in the
+        same call keeps the enlarged budget.
+        """
+        new_budget = min(max(max_tokens, 1) * 2, _LENGTH_RETRY_MAX_TOKENS_CAP)
+        if new_budget <= max_tokens:
+            return None
+        logger.warning(
+            "%s hit %s with %s=%s; retrying with %s=%s",
+            self._provider_name,
+            truncation,
+            budget_key,
+            max_tokens,
+            budget_key,
+            new_budget,
+        )
+        kwargs[budget_key] = new_budget
+        return await send(kwargs), new_budget
 
     def _empty_content_error(self, choice: Any) -> LLMResponseError:
         reasoning = self._reasoning_like_content(getattr(choice, "message", None))

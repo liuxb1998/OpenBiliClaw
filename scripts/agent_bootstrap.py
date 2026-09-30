@@ -92,6 +92,7 @@ SUPPORTED_PROVIDERS = (
     "orcarouter",
     "openai_compatible",
     "requesty",
+    "api_route",
 )
 REMOTE_PROVIDERS = (
     "openai",
@@ -102,6 +103,7 @@ REMOTE_PROVIDERS = (
     "orcarouter",
     "openai_compatible",
     "requesty",
+    "api_route",
 )
 
 # Providers whose backend has no embeddings endpoint. When a user picks
@@ -110,7 +112,14 @@ REMOTE_PROVIDERS = (
 # pulls the embedding model (otherwise embeddings silently fall back at
 # runtime to whatever the registry can find — see registry.py
 # build_embedding_service).
-PROVIDERS_WITHOUT_EMBED = ("claude", "deepseek", "openrouter", "orcarouter", "requesty")
+PROVIDERS_WITHOUT_EMBED = (
+    "claude",
+    "deepseek",
+    "openrouter",
+    "orcarouter",
+    "requesty",
+    "api_route",
+)
 
 
 def ensure_local_no_proxy() -> str:
@@ -195,6 +204,7 @@ HUMAN_LLM_MENU: tuple[tuple[str, str, str], ...] = (
     ("openrouter", "OpenRouter 聚合", "openai/gpt-5-nano"),
     ("orcarouter", "OrcaRouter 聚合", "openai/gpt-4o"),
     ("requesty", "Requesty 聚合", "openai/gpt-4o-mini"),
+    ("api_route", "API Route 聚合", "gpt-5.5"),
 )
 
 HUMAN_OPENAI_COMPAT_PRESETS: tuple[str, ...] = (
@@ -218,6 +228,7 @@ PROVIDER_MODEL_DEFAULTS: dict[str, str] = {
     "openrouter": "openai/gpt-5-nano",
     "orcarouter": "openai/gpt-4o",
     "requesty": "openai/gpt-4o-mini",
+    "api_route": "gpt-5.5",
     "ollama": "qwen2.5:7b",
 }
 
@@ -227,6 +238,7 @@ PROVIDER_BASE_URL_DEFAULTS: dict[str, str] = {
     "openrouter": "https://openrouter.ai/api/v1",
     "orcarouter": "https://api.orcarouter.ai/v1",
     "requesty": "https://router.requesty.ai/v1",
+    "api_route": "https://global.api-route.com/v1",
 }
 
 
@@ -2099,6 +2111,7 @@ def _ensure_llm_instance(project_dir: Path, provider: str) -> str:
         "orcarouter": "OrcaRouter",
         "openai_compatible": "OpenAI-compatible",
         "requesty": "Requesty",
+        "api_route": "API Route",
     }
     update_config_secret(
         config_path,
@@ -3211,6 +3224,7 @@ remote = {
     "orcarouter",
     "openai_compatible",
     "requesty",
+    "api_route",
 }
 instances = llm.get("instances", {}) if isinstance(llm.get("instances"), dict) else {}
 chain = llm.get("default_chain", []) if isinstance(llm.get("default_chain"), list) else []

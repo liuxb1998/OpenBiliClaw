@@ -1829,6 +1829,13 @@ class RuntimeContext:
             # so without this the Phase 3/4 hooks are dead code in production.
             # Guarded for controllers/test doubles lacking the helper.
             pre_admit_hook=getattr(new_runtime_controller, "run_pool_share_maintenance", None),
+            # Dead-letter recovery: re-queue failed_eval rows on resume
+            # notifications (startup after a config rebuild, config_*/manual_*
+            # wakes). Guarded so test-double pipelines without the hook keep
+            # the previous no-revival behavior.
+            revive_failed_eval_callback=getattr(
+                new_candidate_pipeline, "revive_failed_eval_candidates", None
+            ),
             safety_wake_seconds=float(
                 getattr(new_config.scheduler, "refresh_check_interval_seconds", 60)
             ),

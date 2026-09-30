@@ -307,15 +307,22 @@ def test_pool_refill_event_keeps_loaded_cards_and_scroll_position(
     before = _card_report(chromium_page)
     assert all(stamp is not None for stamp in before["stamps"])
 
-    # 后台补货：一轮 refresh 会连发多次 pool_updated。
-    for available in (52, 61, 70):
+    # 后台补货：一轮 refresh 会连发多次 pool_updated。真实后端的提交后库存事件
+    # 带 pool_status_version / platform_available_counts（见 api/app.py
+    # _broadcast_recommendation_pool_status）；头部库存只跟随带版本的已提交快照，
+    # 不再吃无版本事件的裸 pool_available_count（normalizeRuntimeStatus 优先
+    # state.platformAvailability），所以这里必须按真实线上格式注入。
+    for version, available in enumerate((52, 61, 70), start=1):
         chromium_page.evaluate(
-            """(available) => window.__obcPushRuntime({
-              type: 'refresh.pool_updated',
-              pool_available_count: available,
-              message: `候选池补充到 ${available} 条`,
-            })""",
-            available,
+            """(payload) => window.__obcPushRuntime(payload)""",
+            {
+                "type": "refresh.pool_updated",
+                "phase": "done",
+                "pool_available_count": available,
+                "platform_available_counts": {"bilibili": available},
+                "pool_status_version": version,
+                "message": f"候选池补充到 {available} 条",
+            },
         )
         chromium_page.wait_for_timeout(250)
     chromium_page.wait_for_timeout(600)

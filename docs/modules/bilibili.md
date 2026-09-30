@@ -20,6 +20,7 @@
 | 3.1 Cookie 认证 | ✅ | set / load / validate / clear + CLI auth 命令 + 运行时 cookie 回退 |
 | 扩展 Cookie 自动同步 | ✅ | 浏览器扩展可 POST `/api/bilibili/cookie` 持久化 Cookie；后端在 background runtime-stream 连接且缺 Cookie 时会发 `bilibili_cookie_sync_requested` 主动要求扩展回传 |
 | 3.2 核心 API | ✅ | 10+ API 方法 + 限流 + 统一错误处理 |
+| 移动端播放画质 | ✅ | DASH 候选先匹配请求的 `qn`，再在同画质内选择 `preferred_codec`；目标画质不可用时保留候选流回退，`video.qn` 始终表示实际返回的画质。 |
 | 登录态诊断 | ✅ | 任意 `_get_json()` endpoint 返回 `-101` 时抛 `BilibiliAuthExpiredError`；日志使用固定 session-expired 文案提示重新登录或保持扩展在线，不复制远端 message/body。 |
 | 搜索 WBI 化与 412 软降级 | ✅ | `search()` 现会先从 `nav` 获取 WBI key，走 `/x/web-interface/wbi/search/type`；遇到 `412 Precondition Failed` 时会记录 warning 并返回空结果，避免拖垮整轮 discover |
 | 搜索风控冷却（分级） | ✅ | 412（显式 IP 封禁）即时进入硬冷却（base 600s）；`v_voucher`（多为 WBI key churn / 轻限流）改为**阈值化软冷却**——单个关键词耗尽重试只记一次 streak、不触发冷却（整轮其余关键词 + 共用此冷却的 explore 继续出货），但会打开短期 `search_dom_fallback_remaining()` 信号让扩展可补一轮真实搜索页；连续 `_SEARCH_VOUCHER_BLOCK_THRESHOLD`（默认 3）个关键词级耗尽才启用进程级 cooldown（base 缩到 180s）；一旦怀疑风暴（streak>0）后续关键词只做单次快探测、不再每词 ~21s 硬抗，任一成功即清零 streak。所有 BilibiliAPIClient 实例共享冷却和 DOM fallback 状态 |
@@ -39,6 +40,8 @@
 `get_danmaku_texts()` 仅作为返回文本列表的兼容包装。
 
 ## 公开 API
+
+`BilibiliAPIClient.get_play_info(bvid, cid=None, qn=80, preferred_codec="avc")` 为 `/api/bilibili/player/play-url` 返回视频、音轨、选集、字幕与弹幕地址。B 站 DASH 响应可能同时包含多档清晰度，`qn` 匹配优先于编码偏好；不能直接取第一个 AVC 流，否则 480P 请求会错误返回 1080P。若目标画质不在实际候选中，保留既有回退行为，调用方应以响应中的 `video.qn` 判断实际画质。
 
 ### AuthManager
 

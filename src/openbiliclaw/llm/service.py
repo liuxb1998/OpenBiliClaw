@@ -702,6 +702,7 @@ class LLMService:
             "openrouter",
             "orcarouter",
             "requesty",
+            "api_route",
         }:
             return False
 

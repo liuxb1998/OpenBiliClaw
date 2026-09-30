@@ -149,6 +149,7 @@
           <option value="openrouter">OpenRouter</option>
           <option value="orcarouter">OrcaRouter</option>
           <option value="requesty">Requesty</option>
+          <option value="api_route">API Route</option>
           <option value="openai_compatible">OpenAI 兼容接口（自建 / 第三方）</option>
         </select>
 
@@ -300,6 +301,7 @@
       openrouter: ["https://openrouter.ai/keys", "OpenRouter"],
       orcarouter: ["https://www.orcarouter.ai/keys", "OrcaRouter"],
       requesty: ["https://app.requesty.ai/api-keys", "Requesty"],
+      api_route: ["https://global.api-route.com/", "API Route"],
       openai_compatible: ["", ""],
     };
     const DEFAULT_MODELS = {
@@ -310,6 +312,7 @@
       openrouter: "openai/gpt-5-nano",
       orcarouter: "openai/gpt-4o",
       requesty: "openai/gpt-4o-mini",
+      api_route: "gpt-5.5",
       openai_compatible: "",
     };
     const MODEL_DISCOVERY_PROVIDERS = new Set([
@@ -318,6 +321,7 @@
       "openrouter",
       "orcarouter",
       "requesty",
+      "api_route",
       "ollama",
       "openai_compatible",
     ]);

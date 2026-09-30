@@ -39,6 +39,7 @@ import {
   handleDySearchTaskResult,
   handleDyHotTaskResult,
   handleDyFeedTaskResult,
+  ensureDyTaskRecovery,
   pollDyTaskNow,
   type DyFeedResult,
   type DyHotResult,
@@ -620,6 +621,7 @@ async function startServiceWorkerAfterRecovery(): Promise<void> {
   await ensureLinuxdoTaskRecovery();
   await ensureNativeSaveTaskRecovery();
   await ensureV2EXTaskRecovery();
+  await ensureDyTaskRecovery();
   await runtimeStreamReady;
   startPlatformTaskPolling();
   startCookieSync();

@@ -1193,6 +1193,90 @@ def test_pool_maintenance_mutation_notifies_expression_copy_refill() -> None:
     assert coordinator.reasons == ["pool_maintenance"]
 
 
+def _rolled_back_maintenance_result() -> PoolMaintenanceResult:
+    return PoolMaintenanceResult(
+        available_before=5,
+        available_after=5,
+        target=10,
+        protected_available=5,
+        recovered_suppressed=0,
+        trimmed_stale=2,
+        trimmed_explore_cluster=0,
+        trimmed_ready_reserve=0,
+        trimmed_evaluated=0,
+        trimmed_raw=2,
+        trimmed_by_source={"bilibili": 2},
+        deferred_topic_trim=0,
+        deferred_source_trim=0,
+        deferred_stale_trim=0,
+        deferred_explore_cluster_trim=0,
+        raw_before=20,
+        raw_after=20,
+        raw_ceiling=100,
+        untrimmed_raw_excess=0,
+        rolled_back=True,
+        reason="available inventory fell below protected floor: before=5 after=4 target=10",
+        mutation_count=2,
+    )
+
+
+def test_pool_maintenance_rollback_logs_warning_not_error(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    """A rollback is the availability guard working, not an operational fault."""
+    controller = ContinuousRefreshController(
+        memory_manager=_FakeMemoryManager(),
+        database=_FakeDatabase([], pool_count=5),
+        soul_engine=_FakeSoulEngine(),
+        discovery_engine=_FakeDiscoveryEngine(),
+        recommendation_engine=_FakeRecommendationEngine(),
+        pool_target_count=10,
+    )
+
+    with caplog.at_level(logging.INFO):
+        assert (
+            controller._record_pool_maintenance_result(_rolled_back_maintenance_result()) is False
+        )
+
+    records = [
+        record for record in caplog.records if "pool_maintenance available=" in record.getMessage()
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.WARNING
+    # The attempted (reverted) batch is labelled so the count cannot be read
+    # as committed work.
+    assert "mutations=2(attempted)" in records[0].getMessage()
+
+
+def test_pool_maintenance_commit_logs_info_without_attempted_label(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    database = _FakeDatabase([], pool_count=10)
+    controller = ContinuousRefreshController(
+        memory_manager=_FakeMemoryManager(),
+        database=database,
+        soul_engine=_FakeSoulEngine(),
+        discovery_engine=_FakeDiscoveryEngine(),
+        recommendation_engine=_FakeRecommendationEngine(),
+        pool_target_count=10,
+    )
+    result = database.maintain_pool_inventory(
+        target=10,
+        raw_ceiling=20,
+        source_share_quotas={"bilibili": 10},
+    )
+
+    with caplog.at_level(logging.INFO):
+        controller._record_pool_maintenance_result(result)
+
+    records = [
+        record for record in caplog.records if "pool_maintenance available=" in record.getMessage()
+    ]
+    assert len(records) == 1
+    assert records[0].levelno == logging.INFO
+    assert "(attempted)" not in records[0].getMessage()
+
+
 def test_runtime_status_reports_pool_readiness_counts() -> None:
     gate = LLMConcurrencyGate(4)
     controller = ContinuousRefreshController(

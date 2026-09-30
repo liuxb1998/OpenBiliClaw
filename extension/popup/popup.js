@@ -9993,6 +9993,7 @@ function bindSettings() {
     openrouter: "OpenRouter",
     orcarouter: "OrcaRouter",
     requesty: "Requesty",
+    api_route: "API Route",
     ollama: "Ollama",
     openai_compatible: "OpenAI-compatible",
   };
@@ -10004,6 +10005,7 @@ function bindSettings() {
     openrouter: { model: "openai/gpt-5-nano", base_url: "https://openrouter.ai/api/v1" },
     orcarouter: { model: "openai/gpt-4o", base_url: "https://api.orcarouter.ai/v1" },
     requesty: { model: "openai/gpt-4o-mini", base_url: "https://router.requesty.ai/v1" },
+    api_route: { model: "gpt-5.5", base_url: "https://global.api-route.com/v1" },
     ollama: { model: "qwen2.5:7b", base_url: "http://127.0.0.1:11434/v1" },
     openai_compatible: { model: "", base_url: "" },
   };
@@ -10013,6 +10015,7 @@ function bindSettings() {
     "openrouter",
     "orcarouter",
     "requesty",
+    "api_route",
     "ollama",
     "openai_compatible",
   ]);
@@ -10805,6 +10808,9 @@ function bindSettings() {
     setVal("cfgRequestyKey", cfg.llm?.requesty?.api_key);
     setVal("cfgRequestyModel", cfg.llm?.requesty?.model);
     setVal("cfgRequestyBaseUrl", cfg.llm?.requesty?.base_url);
+    setVal("cfgApiRouteKey", cfg.llm?.api_route?.api_key);
+    setVal("cfgApiRouteModel", cfg.llm?.api_route?.model);
+    setVal("cfgApiRouteBaseUrl", cfg.llm?.api_route?.base_url);
     setVal("cfgOpenaiCompatibleKey", cfg.llm?.openai_compatible?.api_key);
     setVal("cfgOpenaiCompatibleModel", cfg.llm?.openai_compatible?.model);
     setVal("cfgOpenaiCompatibleBaseUrl", cfg.llm?.openai_compatible?.base_url);

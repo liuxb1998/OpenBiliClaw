@@ -1120,6 +1120,38 @@ def test_build_config_supports_requesty_provider() -> None:
     assert config.llm.requesty.base_url == "https://router.eu.requesty.ai/v1"
 
 
+def test_build_config_supports_api_route_provider() -> None:
+    config = _build_config(
+        {
+            "llm": {
+                "default_provider": "api_route",
+                "api_route": {
+                    "api_key": "test-key",
+                    "model": "gpt-5.5",
+                    "base_url": "https://global.api-route.com/v1",
+                },
+            }
+        }
+    )
+
+    assert config.llm.default_provider == "api_route"
+    assert config.llm.api_route.api_key == "test-key"
+    assert config.llm.api_route.model == "gpt-5.5"
+    assert config.llm.api_route.base_url == "https://global.api-route.com/v1"
+
+
+def test_validate_runtime_config_requires_api_route_api_key() -> None:
+    config = Config(
+        llm=LLMConfig(
+            default_provider="api_route",
+            api_route=LLMProviderConfig(model="gpt-5.5"),
+        )
+    )
+
+    with pytest.raises(ConfigError, match="llm.api_route.api_key"):
+        validate_runtime_config(config)
+
+
 def test_validate_runtime_config_requires_requesty_api_key() -> None:
     config = Config(
         llm=LLMConfig(

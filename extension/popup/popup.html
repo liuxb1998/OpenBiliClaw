@@ -6776,6 +6776,7 @@
             <option value="openrouter">OpenRouter</option>
             <option value="orcarouter">OrcaRouter</option>
             <option value="requesty">Requesty</option>
+            <option value="api_route">API Route</option>
             <option value="openai_compatible">OpenAI 协议兼容 (Groq/Together/Azure/vLLM)</option>
           </select>
         </div>
@@ -6799,6 +6800,7 @@
             <option value="openrouter">OpenRouter</option>
             <option value="orcarouter">OrcaRouter</option>
             <option value="requesty">Requesty</option>
+            <option value="api_route">API Route</option>
             <option value="openai_compatible">OpenAI 协议兼容 (Groq/Together/Azure/vLLM)</option>
           </select>
         </div>
@@ -6944,6 +6946,21 @@
             <input id="cfgRequestyBaseUrl" type="text" placeholder="https://router.requesty.ai/v1">
           </div>
         </div>
+        <!-- API Route -->
+        <div class="settings-provider-fields" data-provider="api_route">
+          <div class="settings-field">
+            <label for="cfgApiRouteKey">API Route API Key</label>
+            <input id="cfgApiRouteKey" type="password" autocomplete="off">
+          </div>
+          <div class="settings-field">
+            <label for="cfgApiRouteModel">Model</label>
+            <input id="cfgApiRouteModel" type="text" placeholder="gpt-5.5">
+          </div>
+          <div class="settings-field">
+            <label for="cfgApiRouteBaseUrl">Base URL</label>
+            <input id="cfgApiRouteBaseUrl" type="text" placeholder="https://global.api-route.com/v1">
+          </div>
+        </div>
         <!-- OpenAI Compatible -->
         <div class="settings-provider-fields" data-provider="openai_compatible">
           <p class="settings-hint">
@@ -7032,6 +7049,7 @@
             <option value="openrouter">OpenRouter</option>
             <option value="orcarouter">OrcaRouter</option>
             <option value="requesty">Requesty</option>
+            <option value="api_route">API Route</option>
             <option value="openai_compatible">OpenAI 协议兼容</option>
           </select>
         </div>
@@ -7051,6 +7069,7 @@
             <option value="openrouter">OpenRouter</option>
             <option value="orcarouter">OrcaRouter</option>
             <option value="requesty">Requesty</option>
+            <option value="api_route">API Route</option>
             <option value="openai_compatible">OpenAI 协议兼容</option>
           </select>
         </div>
@@ -7070,6 +7089,7 @@
             <option value="openrouter">OpenRouter</option>
             <option value="orcarouter">OrcaRouter</option>
             <option value="requesty">Requesty</option>
+            <option value="api_route">API Route</option>
             <option value="openai_compatible">OpenAI 协议兼容</option>
           </select>
         </div>
@@ -7089,6 +7109,7 @@
             <option value="openrouter">OpenRouter</option>
             <option value="orcarouter">OrcaRouter</option>
             <option value="requesty">Requesty</option>
+            <option value="api_route">API Route</option>
             <option value="openai_compatible">OpenAI 协议兼容</option>
           </select>
         </div>
@@ -8320,6 +8341,7 @@
                 <option value="openrouter">OpenRouter</option>
                 <option value="orcarouter">OrcaRouter</option>
                 <option value="requesty">Requesty</option>
+                <option value="api_route">API Route</option>
                 <option value="ollama">Ollama</option>
                 <option value="openai_compatible">OpenAI-compatible</option>
               </select>

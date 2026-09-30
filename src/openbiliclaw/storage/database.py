@@ -267,7 +267,14 @@ def _looks_like_serialized_llm_payload(value: str) -> bool:
 
 @dataclass(frozen=True)
 class PoolMaintenanceResult:
-    """Observable outcome of one bounded recommendation-pool maintenance pass."""
+    """Observable outcome of one bounded recommendation-pool maintenance pass.
+
+    When ``rolled_back`` is true the transaction was reverted: the
+    ``trimmed_*`` / ``deferred_*`` counters and ``mutation_count`` describe
+    the attempted (uncommitted) batch, while ``available_after`` /
+    ``raw_after`` / ``recovered_suppressed`` describe the durable
+    post-rollback state (the before view, restored).
+    """
 
     available_before: int
     available_after: int
@@ -440,6 +447,12 @@ _MAINTENANCE_DB_BUSY_TIMEOUT_MS = 75
 # while bounding every write transaction; the async runner releases the lock
 # and yields the loop between batches.
 _POOL_MAINTENANCE_BATCH_SIZE = 50
+# failed_eval dead-letter revival: one resume event re-queues at most this
+# many rows, and each row can be resurrected at most this many times ever
+# (persisted in ``eval_revive_count``) so a process restarting against a
+# still-broken provider cannot re-burn LLM quota without bound.
+_FAILED_EVAL_REVIVE_BATCH_SIZE = 500
+_FAILED_EVAL_MAX_REVIVES = 3
 _NATIVE_INTERNAL_RUNNER_PREFIX = "__openbiliclaw_"
 _LEGACY_NATIVE_SAVE_RUNNER_ID = f"{_NATIVE_INTERNAL_RUNNER_PREFIX}legacy_runner__"
 _EXTENSION_NATIVE_SAVE_PLATFORM_SLUGS = {
@@ -2285,7 +2298,12 @@ class Database:
                 source: dict(stats) for source, stats in self._publication_date_filter_stats.items()
             }
 
-    def _publication_date_row_is_eligible(self, row: Mapping[str, Any]) -> bool:
+    def _publication_date_row_is_eligible(
+        self,
+        row: Mapping[str, Any],
+        *,
+        now: datetime | None = None,
+    ) -> bool:
         """Apply strict Bilibili date preference without deleting stored rows."""
         preference = self._publication_date_preference
         if preference is None:
@@ -2304,6 +2322,7 @@ class Database:
                 ),
                 published_at=row.get("published_at", ""),
                 preference=cast("PublicationDatePreference", preference),
+                now=now,
             )
         except (TypeError, ValueError):
             logger.warning("Ignoring invalid publication preference in pool read", exc_info=True)
@@ -7767,6 +7786,60 @@ class Database:
         )
         return int(cursor.rowcount)
 
+    def revive_failed_eval_candidates(
+        self,
+        *,
+        limit: int = _FAILED_EVAL_REVIVE_BATCH_SIZE,
+        max_revives: int = _FAILED_EVAL_MAX_REVIVES,
+    ) -> int:
+        """Re-queue a bounded batch of dead-lettered candidates for evaluation.
+
+        ``failed_eval`` rows have no organic path back to ``pending_eval``:
+        once a provider outage burns through the attempt budget the pool can
+        only drain (field log 2026-08: 568 candidates died to a deepseek
+        401/404 misconfiguration and the pool never refilled). The candidate
+        evaluation coordinator calls this on resume signals — startup after a
+        config rebuild, ``config_*``/``manual_*`` wakes — so rows dead-lettered
+        by a transient provider failure get fresh attempts once evaluation may
+        work again.
+
+        Boundedness: at most ``limit`` rows revive per call, and each row
+        carries a persistent ``eval_revive_count`` capped at ``max_revives``,
+        so restarting against a still-broken provider cannot resurrect the
+        same candidates (and re-burn their LLM attempts) forever. Rows parked
+        for temporal re-review keep their existing owner and are not touched.
+        Returns the number of rows moved back to ``pending_eval``.
+        """
+
+        max_rows = max(0, int(limit))
+        if max_rows <= 0:
+            return 0
+        revive_cap = max(0, int(max_revives))
+        cursor = self._execute_write(
+            """
+            UPDATE discovery_candidates
+            SET status = 'pending_eval',
+                eval_attempts = 0,
+                batch_eval_attempts = 0,
+                eval_revive_count = eval_revive_count + 1,
+                eval_error = '',
+                claimed_at = NULL,
+                claim_token = NULL,
+                last_seen_at = CURRENT_TIMESTAMP
+            WHERE id IN (
+                SELECT id
+                FROM discovery_candidates
+                WHERE status = 'failed_eval'
+                  AND eval_revive_count < ?
+                  AND COALESCE(eval_error, '') NOT LIKE 'temporal_review_due:%'
+                ORDER BY id ASC
+                LIMIT ?
+            )
+            """,
+            (revive_cap, max_rows),
+        )
+        return int(cursor.rowcount)
+
     def mark_discovery_candidate_cached(self, candidate_id: int) -> None:
         """Mark an evaluated candidate as successfully inserted into content_cache."""
 
@@ -7971,6 +8044,7 @@ class Database:
         conn: sqlite3.Connection,
         *,
         source_platform: str | None = None,
+        _now: datetime | None = None,
     ) -> list[dict[str, Any]]:
         """Return non-terminal discovery rows that still count as supply.
 
@@ -7978,6 +8052,9 @@ class Database:
         so they remain fail-open. ``evaluated`` rows can cross a temporal TTL
         while waiting for pool headroom and are rechecked here before they
         influence readiness, raw ceilings, or source-share rebalancing.
+
+        ``_now`` pins the temporal recheck clock so callers measuring inside
+        one transaction (pool maintenance) share a single time baseline.
         """
 
         source = str(source_platform or "").strip()
@@ -8003,7 +8080,7 @@ class Database:
             """,
             (source,) if source else (),
         )
-        temporal_now = datetime.now(UTC)
+        temporal_now = _now or datetime.now(UTC)
         rows: list[dict[str, Any]] = []
         for row in cursor.fetchall():
             item = dict(row)
@@ -8500,6 +8577,7 @@ class Database:
         xhs_self_nickname: str,
         *,
         pool_status: str = "fresh",
+        _delight_threshold: float | None = None,
     ) -> tuple[str, tuple[Any, ...]]:
         """Shared WHERE fragment + params defining a ``serve()``-loadable row.
 
@@ -8510,12 +8588,21 @@ class Database:
         rows carrying an ``xsec_token``, not claimed by the delight channel,
         and not already recommended. Returns the fragment (no leading
         ``WHERE``, references the ``content_cache`` table) and its bind params.
+
+        ``_delight_threshold`` pins the delight guard's score boundary; the
+        pool-maintenance transaction passes its pre-mutation snapshot so the
+        guard cannot drift as the transaction rewrites ``pool_status`` rows
+        that feed the dynamic percentile sample.
         """
         admission_sql, admission_params = self._pool_admission_sql()
         guard_sql = _xhs_self_author_guard_sql()
         guard_params = _xhs_self_author_guard_params(xhs_self_nickname)
-        delight_threshold = self._dynamic_delight_threshold_on(
-            conn, default_threshold=_DELIGHT_CLAIM_MIN_SCORE
+        delight_threshold = (
+            float(_delight_threshold)
+            if _delight_threshold is not None
+            else self._dynamic_delight_threshold_on(
+                conn, default_threshold=_DELIGHT_CLAIM_MIN_SCORE
+            )
         )
         delight_guard_sql = _delight_claim_guard_sql()
         clause = f"""
@@ -8708,6 +8795,8 @@ class Database:
         max_per_topic_group: int = 3,
         xhs_self_nickname: str = "",
         _viewed_content_keys: set[str] | None = None,
+        _now: datetime | None = None,
+        _delight_threshold: float | None = None,
         full_rows: bool = False,
     ) -> list[dict[str, Any]]:
         """Load rows counted by the frontend-visible pool availability gate.
@@ -8720,12 +8809,22 @@ class Database:
         rows without touching the gate or ordering, so platform-scoped serve
         reads can hand complete candidates to the recommendation path while
         still coming from the exact set the counts report.
+
+        ``_now`` / ``_delight_threshold`` pin the measurement baseline: the
+        pool-maintenance transaction passes one shared timestamp and one
+        pre-mutation threshold snapshot to every scan so before/after
+        availability cannot diverge on clock drift or on a percentile
+        boundary the transaction's own writes shifted.
         """
         admission_sql, admission_params = self._pool_admission_sql()
         guard_sql = _xhs_self_author_guard_sql()
         guard_params = _xhs_self_author_guard_params(xhs_self_nickname)
-        delight_threshold = self._dynamic_delight_threshold_on(
-            conn, default_threshold=_DELIGHT_CLAIM_MIN_SCORE
+        delight_threshold = (
+            float(_delight_threshold)
+            if _delight_threshold is not None
+            else self._dynamic_delight_threshold_on(
+                conn, default_threshold=_DELIGHT_CLAIM_MIN_SCORE
+            )
         )
         delight_guard_sql = _delight_claim_guard_sql()
         projection = (
@@ -8789,6 +8888,7 @@ class Database:
         filtered = self._filter_available_pool_candidate_rows(
             rows,
             viewed_content_keys=viewed_content_keys,
+            now=_now,
         )
         return self._apply_pool_topic_window(
             filtered,
@@ -8800,18 +8900,24 @@ class Database:
         rows: Sequence[Mapping[str, Any]],
         *,
         viewed_content_keys: set[str],
+        now: datetime | None = None,
     ) -> list[dict[str, Any]]:
-        """Apply the Python half of the canonical availability gate."""
+        """Apply the Python half of the canonical availability gate.
+
+        ``now`` defaults to the current time; the pool-maintenance
+        transaction passes one shared timestamp so its before/after scans
+        cannot disagree about rows sitting on a temporal boundary.
+        """
 
         filtered: list[dict[str, Any]] = []
-        now = datetime.now(UTC)
+        effective_now = now or datetime.now(UTC)
         for row in rows:
             row_dict = dict(row)
             if not str(row_dict.get("bvid", "")).strip():
                 continue
-            if not Database._temporal_eligibility_for_row(row_dict, now=now):
+            if not Database._temporal_eligibility_for_row(row_dict, now=effective_now):
                 continue
-            if not self._publication_date_row_is_eligible(row_dict):
+            if not self._publication_date_row_is_eligible(row_dict, now=effective_now):
                 continue
             if Database._is_viewed_row(row_dict, viewed_content_keys):
                 continue
@@ -8920,8 +9026,14 @@ class Database:
         conn: sqlite3.Connection,
         *,
         _viewed_content_keys: set[str] | None = None,
+        _now: datetime | None = None,
     ) -> list[dict[str, Any]]:
-        """Connection-aware raw content-cache rows governed by the ceiling."""
+        """Connection-aware raw content-cache rows governed by the ceiling.
+
+        ``_now`` pins the temporal-eligibility clock; the pool-maintenance
+        transaction passes its shared timestamp so raw counts and trim plans
+        inside one transaction cannot disagree at a temporal boundary.
+        """
         admission_sql, admission_params = self._pool_admission_sql()
         cursor = conn.execute(
             f"""
@@ -8964,7 +9076,7 @@ class Database:
             else _viewed_content_keys
         )
         rows: list[dict[str, Any]] = []
-        now = datetime.now(UTC)
+        now = _now or datetime.now(UTC)
         for row in cursor.fetchall():
             row_dict = dict(row)
             if not str(row_dict.get("bvid", "")).strip():
@@ -8987,13 +9099,15 @@ class Database:
         conn: sqlite3.Connection,
         *,
         _viewed_content_keys: set[str] | None = None,
+        _now: datetime | None = None,
     ) -> int:
         return len(
             self._load_pool_raw_material_rows_on(
                 conn,
                 _viewed_content_keys=_viewed_content_keys,
+                _now=_now,
             )
-        ) + len(self._load_temporally_eligible_admission_waiting_rows_on(conn))
+        ) + len(self._load_temporally_eligible_admission_waiting_rows_on(conn, _now=_now))
 
     def count_pool_raw_material_by_source(self) -> dict[str, int]:
         """Return raw fresh material grouped by source family.
@@ -9812,19 +9926,26 @@ class Database:
         *,
         protected_ids: set[str],
         max_age_days: int,
+        _now: datetime | None = None,
     ) -> _ContentTrimPlan:
+        # Compute the age cutoff against the caller's time baseline instead of
+        # per-statement ``datetime('now')`` so every planner inside one
+        # maintenance transaction measures staleness against the same instant.
+        cutoff = ((_now or datetime.now(UTC)) - timedelta(days=max(0, int(max_age_days)))).strftime(
+            "%Y-%m-%d %H:%M:%S"
+        )
         rows = conn.execute(
             """
             SELECT bvid
             FROM content_cache
             WHERE COALESCE(pool_status, 'fresh') = 'fresh'
-              AND discovered_at < datetime('now', '-' || ? || ' days')
+              AND discovered_at < ?
               AND NOT EXISTS (
                 SELECT 1 FROM recommendations AS r WHERE r.bvid = content_cache.bvid
               )
             ORDER BY discovered_at ASC, bvid ASC
             """,
-            (max_age_days,),
+            (cutoff,),
         ).fetchall()
         stale_ids = [str(row["bvid"]) for row in rows]
         return _ContentTrimPlan(
@@ -9838,6 +9959,7 @@ class Database:
         *,
         protected_ids: set[str],
         max_per_cluster: int,
+        _now: datetime | None = None,
     ) -> _ContentTrimPlan:
         admission_sql, admission_params = self._pool_admission_sql()
         rows = [
@@ -9860,7 +9982,7 @@ class Database:
             ).fetchall()
         ]
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        temporal_now = datetime.now(UTC)
+        temporal_now = _now or datetime.now(UTC)
         for row in rows:
             if not self._temporal_eligibility_for_row(row, now=temporal_now):
                 continue
@@ -9891,6 +10013,7 @@ class Database:
         *,
         protected_ids: set[str],
         max_per_topic_group: int,
+        _now: datetime | None = None,
     ) -> _ContentTrimPlan:
         if max_per_topic_group <= 0:
             return _ContentTrimPlan()
@@ -9920,7 +10043,7 @@ class Database:
             ).fetchall()
         ]
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
-        temporal_now = datetime.now(UTC)
+        temporal_now = _now or datetime.now(UTC)
         for row in rows:
             if not self._temporal_eligibility_for_row(row, now=temporal_now):
                 continue
@@ -9951,11 +10074,13 @@ class Database:
         protected_ids: set[str],
         source_share_quotas: Mapping[str, int],
         _viewed_content_keys: set[str] | None = None,
+        _now: datetime | None = None,
     ) -> _ContentTrimPlan:
         grouped: dict[str, list[dict[str, Any]]] = defaultdict(list)
         for row in self._load_pool_raw_material_rows_on(
             conn,
             _viewed_content_keys=_viewed_content_keys,
+            _now=_now,
         ):
             if not self._content_is_ready_reserve(row):
                 continue
@@ -10015,13 +10140,15 @@ class Database:
         raw_ceiling: int,
         raw_source_share_quotas: Mapping[str, int],
         _viewed_content_keys: set[str] | None = None,
+        _now: datetime | None = None,
     ) -> _RawTrimPlan:
         content_rows = self._load_pool_raw_material_rows_on(
             conn,
             _viewed_content_keys=_viewed_content_keys,
+            _now=_now,
         )
         candidate_rows = [
-            row for row in self._load_temporally_eligible_admission_waiting_rows_on(conn)
+            row for row in self._load_temporally_eligible_admission_waiting_rows_on(conn, _now=_now)
         ]
         raw_count = len(content_rows) + len(candidate_rows)
         excess = max(0, raw_count - raw_ceiling)
@@ -10165,6 +10292,8 @@ class Database:
         xhs_self_nickname: str,
         max_restore: int = _POOL_MAINTENANCE_BATCH_SIZE,
         _viewed_content_keys: set[str] | None = None,
+        _now: datetime | None = None,
+        _delight_threshold: float | None = None,
     ) -> list[str]:
         """Restore a bounded set of paid-for rows without rescanning per row.
 
@@ -10185,6 +10314,8 @@ class Database:
             conn,
             xhs_self_nickname=xhs_self_nickname,
             _viewed_content_keys=_viewed_content_keys,
+            _now=_now,
+            _delight_threshold=_delight_threshold,
         )
         desired_available = len(available_rows) + clean_deficit
         current_family_count: dict[str, int] = defaultdict(int)
@@ -10201,6 +10332,7 @@ class Database:
             conn,
             xhs_self_nickname,
             pool_status="suppressed",
+            _delight_threshold=_delight_threshold,
         )
         candidate_rows = [
             dict(row)
@@ -10219,7 +10351,7 @@ class Database:
             if _viewed_content_keys is None
             else _viewed_content_keys
         )
-        temporal_now = datetime.now(UTC)
+        temporal_now = _now or datetime.now(UTC)
         eligible_rows = [
             row
             for row in candidate_rows
@@ -10338,6 +10470,26 @@ class Database:
         write_ms = 0.0
         temporal_due_count = 0
         temporal_due_has_more = False
+        # Rollback reporting: track the attempted batch so a rolled-back
+        # result can describe what the transaction tried to write instead of
+        # fabricating zeros. Every write is still reverted on rollback; these
+        # counters only record intent up to the failure point.
+        recovered_ids: list[str] = []
+        stale_plan = _ContentTrimPlan()
+        explore_plan = _ContentTrimPlan()
+        topic_plan = _ContentTrimPlan()
+        source_plan = _ContentTrimPlan()
+        raw_plan = _RawTrimPlan()
+        stale_ids: set[str] = set()
+        explore_ids: set[str] = set()
+        topic_ids: set[str] = set()
+        source_ids: set[str] = set()
+        initial_raw_rows: dict[str, dict[str, Any]] = {}
+        all_content_victims: set[str] = set()
+        trimmed_ready_reserve = 0
+        trimmed_evaluated = 0
+        trimmed_raw = 0
+        trimmed_by_source: dict[str, int] = {}
         try:
             conn = self.open_connection()
             if isinstance(conn, sqlite3.Connection):
@@ -10345,12 +10497,29 @@ class Database:
             lock_started = time.perf_counter()
             conn.execute("BEGIN IMMEDIATE")
             lock_wait_ms = (time.perf_counter() - lock_started) * 1000.0
+            # One measurement baseline for the whole transaction. Both
+            # canonical availability scans (before/after) and every planner
+            # below must observe identical time and delight-threshold inputs:
+            # a fresh clock per scan lets a row crossing temporal_valid_until
+            # mid-transaction fake an inventory drop, and recomputing the
+            # dynamic delight threshold per scan lets the transaction's own
+            # pool_status writes shift the percentile sample. Either noise
+            # source makes after < min(before, target) and rolled a healthy
+            # batch back forever once the pool sat below target (field log
+            # 2026-08: 652 consecutive rollbacks with mutations=0).
+            maintenance_now = datetime.now(UTC)
             temporal_due_count, temporal_due_has_more = (
                 self._transition_temporally_due_pool_items_on(
                     conn,
-                    now=datetime.now(UTC),
+                    now=maintenance_now,
                     limit=mutation_budget,
                 )
+            )
+            # Snapshot the delight threshold after the temporal transitions
+            # (they already rewrote pool_status for this batch) but before any
+            # trim/recovery write below can shift the percentile sample.
+            delight_threshold = self._dynamic_delight_threshold_on(
+                conn, default_threshold=_DELIGHT_CLAIM_MIN_SCORE
             )
             maintenance_budget = max(0, mutation_budget - temporal_due_count)
             # All maintenance reads share one write transaction, so the view
@@ -10362,17 +10531,19 @@ class Database:
                 conn,
                 xhs_self_nickname=xhs_self_nickname,
                 _viewed_content_keys=viewed_content_keys,
+                _now=maintenance_now,
+                _delight_threshold=delight_threshold,
             )
             available_before = len(before_rows)
             snapshot_acquired = True
             raw_before = self._count_pool_raw_material_on(
                 conn,
                 _viewed_content_keys=viewed_content_keys,
+                _now=maintenance_now,
             )
             protected_ids = {
                 str(row["bvid"]) for row in before_rows[: min(len(before_rows), clean_target)]
             }
-            recovered_ids: list[str] = []
             # Suppressed rows do not count as raw material until restored. Never
             # restore through an already-exhausted raw ceiling: doing so used to
             # alternate forever with the next batch's capacity trim while the
@@ -10390,12 +10561,16 @@ class Database:
                     xhs_self_nickname=xhs_self_nickname,
                     max_restore=recovery_budget,
                     _viewed_content_keys=viewed_content_keys,
+                    _now=maintenance_now,
+                    _delight_threshold=delight_threshold,
                 )
                 recovery_ms = (time.perf_counter() - phase_started) * 1000.0
                 recovered_available_rows = self._load_available_pool_candidate_rows_on(
                     conn,
                     xhs_self_nickname=xhs_self_nickname,
                     _viewed_content_keys=viewed_content_keys,
+                    _now=maintenance_now,
+                    _delight_threshold=delight_threshold,
                 )
                 recovered_set = set(recovered_ids)
                 visible_recovered = {
@@ -10437,6 +10612,7 @@ class Database:
                 for row in self._load_pool_raw_material_rows_on(
                     conn,
                     _viewed_content_keys=viewed_content_keys,
+                    _now=maintenance_now,
                 )
             }
 
@@ -10445,6 +10621,7 @@ class Database:
                 conn,
                 protected_ids=protected_ids,
                 max_age_days=clean_stale_days,
+                _now=maintenance_now,
             )
             stale_trim_ms = (time.perf_counter() - phase_started) * 1000.0
             phase_started = time.perf_counter()
@@ -10452,6 +10629,7 @@ class Database:
                 conn,
                 protected_ids=protected_ids,
                 max_per_cluster=clean_explore_cap,
+                _now=maintenance_now,
             )
             explore_trim_ms = (time.perf_counter() - phase_started) * 1000.0
             phase_started = time.perf_counter()
@@ -10459,6 +10637,7 @@ class Database:
                 conn,
                 protected_ids=protected_ids,
                 max_per_topic_group=clean_topic_cap,
+                _now=maintenance_now,
             )
             topic_trim_ms = (time.perf_counter() - phase_started) * 1000.0
             phase_started = time.perf_counter()
@@ -10467,6 +10646,7 @@ class Database:
                 protected_ids=protected_ids,
                 source_share_quotas=clean_source_quotas,
                 _viewed_content_keys=viewed_content_keys,
+                _now=maintenance_now,
             )
             source_trim_ms = (time.perf_counter() - phase_started) * 1000.0
 
@@ -10524,24 +10704,11 @@ class Database:
                 untrimmed_excess=full_raw_plan.untrimmed_excess,
             )
             raw_trim_ms = (time.perf_counter() - phase_started) * 1000.0
-            write_started = time.perf_counter()
-            self._apply_raw_trim_on(conn, raw_plan)
-            write_ms += (time.perf_counter() - write_started) * 1000.0
-            after_rows = self._load_available_pool_candidate_rows_on(
-                conn,
-                xhs_self_nickname=xhs_self_nickname,
-                _viewed_content_keys=viewed_content_keys,
-            )
-            raw_after = self._count_pool_raw_material_on(
-                conn,
-                _viewed_content_keys=viewed_content_keys,
-            )
-            self._validate_pool_maintenance_invariant(
-                available_before=available_before,
-                available_after=len(after_rows),
-                target=clean_target,
-            )
 
+            # Victim statistics derive only from the plans and the pre-write
+            # raw snapshot, so they stay valid even when the invariant below
+            # rolls the transaction back; the rollback branch reports them
+            # instead of fabricating zeros.
             all_content_victims = (
                 stale_ids | explore_ids | topic_ids | source_ids | set(raw_plan.content_bvids)
             )
@@ -10557,13 +10724,11 @@ class Database:
                 if bvid in initial_raw_rows
             ) + sum(status == "pending_eval" for status in candidate_statuses.values())
             trimmed_evaluated = sum(status == "evaluated" for status in candidate_statuses.values())
-            trimmed_by_source: dict[str, int] = defaultdict(int)
+            by_source: dict[str, int] = defaultdict(int)
             for bvid in all_content_victims:
                 row = initial_raw_rows.get(bvid)
                 if row is not None:
-                    trimmed_by_source[
-                        _pool_source_family(row["source"], row["source_platform"])
-                    ] += 1
+                    by_source[_pool_source_family(row["source"], row["source_platform"])] += 1
             if raw_plan.candidate_ids:
                 placeholders = ", ".join("?" for _ in raw_plan.candidate_ids)
                 for row in conn.execute(
@@ -10574,9 +10739,31 @@ class Database:
                     """,
                     raw_plan.candidate_ids,
                 ).fetchall():
-                    trimmed_by_source[
+                    by_source[
                         _pool_source_family(row["source_strategy"], row["source_platform"])
                     ] += 1
+            trimmed_by_source = dict(by_source)
+
+            write_started = time.perf_counter()
+            self._apply_raw_trim_on(conn, raw_plan)
+            write_ms += (time.perf_counter() - write_started) * 1000.0
+            after_rows = self._load_available_pool_candidate_rows_on(
+                conn,
+                xhs_self_nickname=xhs_self_nickname,
+                _viewed_content_keys=viewed_content_keys,
+                _now=maintenance_now,
+                _delight_threshold=delight_threshold,
+            )
+            raw_after = self._count_pool_raw_material_on(
+                conn,
+                _viewed_content_keys=viewed_content_keys,
+                _now=maintenance_now,
+            )
+            self._validate_pool_maintenance_invariant(
+                available_before=available_before,
+                available_after=len(after_rows),
+                target=clean_target,
+            )
 
             recovered_suppressed = 0
             if recovered_ids:
@@ -10615,7 +10802,7 @@ class Database:
                 trimmed_ready_reserve=trimmed_ready_reserve,
                 trimmed_evaluated=trimmed_evaluated,
                 trimmed_raw=trimmed_raw,
-                trimmed_by_source=dict(trimmed_by_source),
+                trimmed_by_source=trimmed_by_source,
                 deferred_topic_trim=topic_plan.deferred,
                 deferred_source_trim=source_plan.deferred,
                 deferred_stale_trim=stale_plan.deferred,
@@ -10662,28 +10849,41 @@ class Database:
                     "pool maintenance snapshot unavailable"
                 ) from exc
             logger.error("pool maintenance rolled back: %s", exc)
+            # Truthful rollback reporting: the trim/recovery counters describe
+            # the attempted (now reverted) batch so operators can see what the
+            # transaction tried to do; inventory counts describe the durable
+            # post-rollback state (the rollback restored the before view).
             return PoolMaintenanceResult(
                 available_before=available_before,
                 available_after=available_before,
                 target=clean_target,
                 protected_available=len(protected_ids),
                 recovered_suppressed=0,
-                trimmed_stale=0,
-                trimmed_explore_cluster=0,
-                trimmed_ready_reserve=0,
-                trimmed_evaluated=0,
-                trimmed_raw=0,
-                trimmed_by_source={},
-                deferred_topic_trim=0,
-                deferred_source_trim=0,
-                deferred_stale_trim=0,
-                deferred_explore_cluster_trim=0,
+                trimmed_stale=len(stale_ids),
+                trimmed_explore_cluster=len(explore_ids),
+                trimmed_ready_reserve=trimmed_ready_reserve,
+                trimmed_evaluated=trimmed_evaluated,
+                trimmed_raw=trimmed_raw,
+                trimmed_by_source=trimmed_by_source,
+                deferred_topic_trim=topic_plan.deferred,
+                deferred_source_trim=source_plan.deferred,
+                deferred_stale_trim=stale_plan.deferred,
+                deferred_explore_cluster_trim=explore_plan.deferred,
                 raw_before=raw_before,
                 raw_after=raw_before,
                 raw_ceiling=clean_raw_ceiling,
                 untrimmed_raw_excess=max(0, raw_before - clean_raw_ceiling),
                 rolled_back=True,
                 reason=str(exc),
+                mutation_count=(
+                    temporal_due_count
+                    + len(recovered_ids)
+                    + len(all_content_victims)
+                    + len(raw_plan.candidate_ids)
+                ),
+                # A rollback must never spin the per-tick batch loop: the next
+                # scheduled tick re-attempts with a fresh transaction.
+                has_more=False,
                 lock_wait_ms=lock_wait_ms,
                 recovery_ms=recovery_ms,
                 stale_trim_ms=stale_trim_ms,
@@ -14716,6 +14916,9 @@ class Database:
             "temporal_evidence_complete": "INTEGER NOT NULL DEFAULT 0",
             "temporal_review_attempts": "INTEGER NOT NULL DEFAULT 0",
             "temporal_review_retry_at": "TEXT NOT NULL DEFAULT ''",
+            # Dead-letter revival budget: persisted so restarting against a
+            # still-broken provider cannot resurrect the same rows forever.
+            "eval_revive_count": "INTEGER NOT NULL DEFAULT 0",
         }
         for column_name, column_type in required_columns.items():
             if column_name in existing_columns:

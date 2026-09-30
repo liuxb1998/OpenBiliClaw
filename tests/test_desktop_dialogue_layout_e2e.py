@@ -152,7 +152,14 @@ def test_many_dialogue_cards_keep_natural_height_and_scroll(
     assert before["scrollHeight"] > before["clientHeight"] * 4
     chromium_page.locator("#chatLog").hover()
     chromium_page.mouse.wheel(0, 700)
-    chromium_page.wait_for_timeout(80)
+    # 滚轮滚动在 headless Chromium 里由合成器异步落地（实测 80ms 固定等待在
+    # 并行负载下会早采样到 scrollTop=0，滚动随后才到）；必须等到 scrollTop
+    # 真正前进再采样，不能把时序当成布局契约。
+    chromium_page.wait_for_function(
+        "(threshold) => document.querySelector('#chatLog').scrollTop > threshold",
+        arg=before["scrollTop"],
+        timeout=5000,
+    )
     after = _scroll_report(chromium_page, "#chatLog")
     assert after["scrollTop"] > before["scrollTop"]
 
@@ -169,7 +176,14 @@ def test_pending_inbox_is_bounded_and_independently_scrollable(chromium_page: Pa
     assert panel["scrollHeight"] > panel["clientHeight"]
     chromium_page.locator("#desktopPendingConfirmations").hover()
     chromium_page.mouse.wheel(0, 500)
-    chromium_page.wait_for_timeout(80)
+    # 与 #chatLog 相同：滚轮滚动由合成器异步落地，固定等待会早采样，
+    # 必须等到 scrollTop 真正前进再断言。
+    chromium_page.wait_for_function(
+        "(threshold) => document.querySelector('#desktopPendingConfirmations')"
+        ".scrollTop > threshold",
+        arg=panel["scrollTop"],
+        timeout=5000,
+    )
     after = _scroll_report(chromium_page, "#desktopPendingConfirmations")
     assert after["scrollTop"] > panel["scrollTop"]
 

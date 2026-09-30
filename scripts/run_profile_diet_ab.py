@@ -163,6 +163,7 @@ _CACHE_USAGE_SEMANTICS_BY_PROVIDER = {
     "openrouter": "prompt_includes_cached",
     "orcarouter": "prompt_includes_cached",
     "requesty": "prompt_includes_cached",
+    "api_route": "prompt_includes_cached",
 }
 
 
@@ -1912,6 +1913,7 @@ class _ProviderAttemptUsageRecorder:
                 "openrouter",
                 "orcarouter",
                 "requesty",
+                "api_route",
                 "deepseek",
             }:
                 continue
@@ -2482,6 +2484,7 @@ def validate_json_minify_transport(
             "openrouter",
             "orcarouter",
             "requesty",
+            "api_route",
             "deepseek",
         }:
             if call.get("provider_attempt_accounting") != "raw_adapter_attempts":
@@ -2945,6 +2948,7 @@ def validate_candidate_transport_experiment(
             "openrouter",
             "orcarouter",
             "requesty",
+            "api_route",
             "deepseek",
         }:
             if call.get("provider_attempt_accounting") != "raw_adapter_attempts":

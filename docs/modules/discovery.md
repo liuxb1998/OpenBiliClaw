@@ -919,6 +919,7 @@ drained = await pipeline.drain_pending(profile=profile, batch_size=45)
 - `drain_pending()` 会读取 evaluator 的 `_EVALUATE_BATCH_HARD_CAP` 并 clamp claim size，避免配置把 batch_size 调到 evaluator hard-cap 之上时，尾部候选被当作 0 分低相关永久拒绝。
 - API runtime 构造 pipeline 时会读取配置的 `eval_min_batch_size`、`eval_max_wait_seconds`，并启用 `candidate_fetch_oversample=4`；少于最小批量的 `pending_eval` 会先等待，超时才跑小 batch，协调器按 `eval_ready_in_seconds()` 返回的剩余时间唤醒。即使 refresh 缺口算法给出的 `batch_size` 小于最小批量，pipeline 也会把 claim size 抬到该下限（仍受 evaluator hard cap 约束）。CLI 手动 producer pipeline 固定 `min=1 / wait=0` 立即 drain，因为一次性进程不能可靠承载跨命令的内存计时。主 B 站 refresh 会先通过 `ensure_pending_supply()` 把待评估队列补到有效水位，再由 evaluator 消费，降低重复 discovery 让 evaluator 只拿到 1-3 条的概率。
 - `drain_pending()` 自带共享 async lock；`ContinuousRefreshController.drain_discovery_candidates_once()` 与周期 `_loop_candidate_eval()` 也会在 controller 层串行化外部触发。所有入口都会先检查 `count_pool_candidates() >= pool_target_count`；正式可换推荐池满时不再评估 / 入池。周期 loop 在 admission 后会触发 `precompute_pool_copy()`，把刚入 `content_cache` 但缺文案的候选整理成可换库存。
+- `revive_failed_eval_candidates()` 是死信复活委托：`CandidateEvalCoordinator` 在恢复信号（config rebuild 后的 `startup`、`config_*` / `manual_*` 唤醒）时调用，转发给 `Database.revive_failed_eval_candidates()` 把 `failed_eval` 候选拉回 `pending_eval`；单次限量与每候选持久化复活次数上限由 storage 保证（详见 storage.md）。对没有该方法的 storage 测试替身以 `getattr` 守卫返回 0，委托自身异常也只记 DEBUG。
 - 普通入池兜底阈值是 `[discovery].admission_min_score=0.60`；候选行可携带更严格的 strategy 阈值，explore 默认 `0.58`（backfill 最低 `0.55`）作为探索鼓励，普通 backfill 最低不低于 `0.60`。来源 / 平台标签不参与降阈值。
 
 更直白地说，`ContentDiscoveryEngine` 负责最后的“收口”：

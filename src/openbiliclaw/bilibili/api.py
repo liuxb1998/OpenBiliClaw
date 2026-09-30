@@ -776,14 +776,20 @@ class BilibiliAPIClient:
             video_items = dash.get("video", []) or []
             audio_items = dash.get("audio", []) or []
             if isinstance(video_items, list) and video_items:
+                # DASH responses contain several qualities even when qn is
+                # explicit. Choose that quality first, then its preferred
+                # codec; the first AVC stream may be a different resolution.
+                candidates = [item for item in video_items if isinstance(item, dict)]
+                matching_quality = [
+                    item for item in candidates if int(item.get("id", 0) or 0) == qn
+                ]
+                candidates = matching_quality or candidates
                 preferred = []
-                for item in video_items:
-                    if not isinstance(item, dict):
-                        continue
+                for item in candidates:
                     codec = str(item.get("codecs", "") or "")
                     if codec.lower().startswith(preferred_codec.lower()):
                         preferred.append(item)
-                chosen = preferred[0] if preferred else video_items[0]
+                chosen = (preferred or candidates)[0] if candidates else None
                 if isinstance(chosen, dict):
                     video = {
                         "qn": int(chosen.get("id", 0) or 0),

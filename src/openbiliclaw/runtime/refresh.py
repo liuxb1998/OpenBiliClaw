@@ -1044,7 +1044,18 @@ class ContinuousRefreshController:
 
     def _record_pool_maintenance_result(self, result: PoolMaintenanceResult) -> bool:
         """Publish one batch's metrics and update the in-memory inventory gate."""
-        log_fn = logger.error if result.rolled_back else logger.info
+        # A rollback is the availability guard working as designed (the batch
+        # is retried on the next tick), not an operational fault — keep it at
+        # WARNING so ERROR stays reserved for genuinely unexpected failures
+        # (e.g. the ``bounded pool maintenance failed`` exception path).
+        log_fn = logger.warning if result.rolled_back else logger.info
+        # On a rollback the mutation counter reports the attempted (reverted)
+        # batch; label it so the count is not read as committed work.
+        mutations_label = (
+            f"{getattr(result, 'mutation_count', 0)}(attempted)"
+            if result.rolled_back
+            else str(getattr(result, "mutation_count", 0))
+        )
         log_fn(
             "pool_maintenance available=%s->%s target=%s raw=%s->%s/%s "
             "mutations=%s has_more=%s lock_wait_ms=%.1f total_ms=%.1f "
@@ -1055,7 +1066,7 @@ class ContinuousRefreshController:
             result.raw_before,
             result.raw_after,
             result.raw_ceiling,
-            getattr(result, "mutation_count", 0),
+            mutations_label,
             getattr(result, "has_more", False),
             float(getattr(result, "lock_wait_ms", 0.0)),
             float(getattr(result, "total_ms", 0.0)),

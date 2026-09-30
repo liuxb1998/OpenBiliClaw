@@ -10,9 +10,12 @@ import inspect
 import json
 import os
 import re
+import signal
+import subprocess
 import sys
 import threading
 import uuid
+from collections.abc import Callable
 from contextlib import suppress
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -1007,9 +1010,7 @@ def _build_recommendation_engine() -> Any:
         ),
         danmaku_max_chars=int(getattr(getattr(cfg, "discovery", None), "danmaku_max_chars", 500)),
         bilibili_client=_build_bilibili_client() if _danmaku_on else None,
-        serve_snapshot_store=ServeSnapshotStore(
-            cfg.data_path / "runtime" / "serve_snapshot.json"
-        ),
+        serve_snapshot_store=ServeSnapshotStore(cfg.data_path / "runtime" / "serve_snapshot.json"),
         serve_outbox=ServeOutbox(cfg.data_path / "runtime" / "serve_outbox.jsonl"),
         reply_style=str(getattr(cfg.soul, "reply_style", "")),
     )
@@ -1141,6 +1142,71 @@ def _worker_mode_requested() -> bool:
     return value not in {"0", "false", "no", "off"}
 
 
+def _spawn_background_child(name: str, module: str, env: dict[str, str]) -> subprocess.Popen[bytes]:
+    """拉起一个后台子进程,并把它的 stdout/stderr 落盘到 logs/child-<name>.log。
+
+    Windows 桌面包用 ``pythonw.exe``(无控制台)跑 ``cli start``:Windows 上
+    Python 默认 ``close_fds=True``,不显式传 stdout/stderr 时子进程拿不到
+    任何标准句柄,子 ``pythonw`` 的 ``sys.stdout`` / ``sys.stderr`` 为
+    ``None``——recommendation_server / image_service 一写标准流就抛异常
+    静默退出(stderr 也是 None,连堆栈都留不下)。所以这里必须显式把两个
+    标准流重定向到日志文件。
+
+    Popen 返回时句柄已经 fork/CreateProcess 传给子进程,父进程保留自己的
+    副本到进程退出由 OS 回收,不做额外生命周期管理。``child-*.log`` 属于
+    logging_setup 的 unmanaged 清理策略(超 200MB 截断、超 30 天删除、
+    logs/ 总预算 500MB),无需单独轮转。
+    """
+    from openbiliclaw.config import load_config
+
+    log_dir = load_config().logging.directory_path
+    log_dir.mkdir(parents=True, exist_ok=True)
+    log_file = open(log_dir / f"child-{name}.log", "a", encoding="utf-8")  # noqa: SIM115 - 句柄须交给子进程,进程生命周期内保持打开
+    try:
+        return subprocess.Popen(
+            [sys.executable, "-m", module],
+            cwd=os.getcwd(),
+            env=env,
+            stdout=log_file,
+            stderr=subprocess.STDOUT,
+        )
+    except Exception:
+        log_file.close()
+        raise
+
+
+def _raise_systemexit_on_signal(signum: int, frame: Any) -> None:
+    """信号处理器:把信号转成 ``SystemExit(128 + signum)``,让 finally 能执行。"""
+    raise SystemExit(128 + signum)
+
+
+def _install_sigterm_cleanup_hook() -> Callable[[], None]:
+    """安装 SIGTERM → SystemExit 钩子,返回恢复原处理器的回调。
+
+    uvicorn(``Server.capture_signals``)优雅退出时会恢复它启动时保存的
+    "原始"信号处理器,然后 ``signal.raise_signal`` 重发捕获的信号:
+    SIGINT 重发后变成 KeyboardInterrupt 异常,能穿过 ``_run_api_server``
+    的 finally;SIGTERM 重发后落到 SIG_DFL 默认处置,进程被直接杀死,
+    finally 里的子进程 terminate 逻辑被跳过,4 个后台子进程变成
+    PPID=1 的孤儿(docker stop / pkill / launchd / systemd 都是 SIGTERM)。
+    在 uvicorn 启动前把 SIGTERM 处理器换成抛 ``SystemExit(143)`` 的钩子,
+    uvicorn 保存/恢复的"原始处理器"就是这个钩子,重发时异常穿过
+    finally,子进程得以清理。SIGINT 现有行为已正确,不动。
+
+    仅在主线程安装(``signal.signal`` 只允许主线程调用);非主线程返回
+    no-op 回调。
+    """
+    if threading.current_thread() is not threading.main_thread():
+        return lambda: None
+
+    previous = signal.signal(signal.SIGTERM, _raise_systemexit_on_signal)
+
+    def _restore() -> None:
+        signal.signal(signal.SIGTERM, previous)
+
+    return _restore
+
+
 def _run_api_server(*, host: str = "127.0.0.1", port: int = 8420) -> None:
     """Run the local FastAPI service used by the browser extension."""
     import uvicorn
@@ -1154,9 +1220,7 @@ def _run_api_server(*, host: str = "127.0.0.1", port: int = 8420) -> None:
         # running; the child worker gets the same flag through the inherited
         # environment below.
         os.environ["OPENBILICLAW_FULL_WORKER"] = "1"
-        recommendation_transport = ensure_recommendation_transport_env(
-            load_config().data_path
-        )
+        recommendation_transport = ensure_recommendation_transport_env(load_config().data_path)
 
     api_app = create_app()
     state = getattr(api_app, "state", None)
@@ -1188,42 +1252,29 @@ def _run_api_server(*, host: str = "127.0.0.1", port: int = 8420) -> None:
     discovery_worker_process: Any | None = None
     recommendation_process: Any | None = None
     image_service_process: Any | None = None
+    # 必须在 uvicorn 启动前装上,uvicorn 保存/恢复的"原始处理器"才是钩子;
+    # 两条 uvicorn 启动路径(uvicorn.run / server.run)都被外层 finally 覆盖。
+    restore_sigterm_handler = _install_sigterm_cleanup_hook()
     try:
         if worker_requested:
-            import subprocess
-
             worker_env = {**os.environ, "OPENBILICLAW_FULL_WORKER": "1"}
-            worker_process = subprocess.Popen(
-                [sys.executable, "-m", "openbiliclaw.worker"],
-                cwd=os.getcwd(),
-                env=worker_env,
-            )
+            worker_process = _spawn_background_child("worker", "openbiliclaw.worker", worker_env)
             _print_status_panel(
                 "info",
                 "Worker 进程",
                 f"已启动独立 full worker pid={worker_process.pid}（OPENBILICLAW_WORKER=1）",
             )
 
-
-
             # Dedicated discovery runtime worker: runs the same
             # ContinuousRefreshController as the API used to, but in a separate
             # process so HTTP endpoints never compete with discovery/eval.
-            import subprocess as _subprocess
-
             discovery_env = {
                 **os.environ,
                 "OPENBILICLAW_DISCOVERY_WORKER": "1",
                 "OPENBILICLAW_FULL_WORKER": "1",
             }
-            discovery_worker_process = _subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "openbiliclaw.discovery_worker",
-                ],
-                cwd=os.getcwd(),
-                env=discovery_env,
+            discovery_worker_process = _spawn_background_child(
+                "discovery-worker", "openbiliclaw.discovery_worker", discovery_env
             )
             _print_status_panel(
                 "info",
@@ -1231,25 +1282,16 @@ def _run_api_server(*, host: str = "127.0.0.1", port: int = 8420) -> None:
                 f"已启动独立 discovery worker pid={discovery_worker_process.pid}",
             )
 
-
             # Dedicated recommendation API process on a Unix socket. The main
             # API proxies /api/recommendations/* here so full recommendation
             # ranking runs on its own process/CPU without extra TCP ports.
-            import subprocess as _subprocess
-
             recommendation_env = {
                 **os.environ,
                 "OPENBILICLAW_RECOMMENDATION_ONLY": "1",
                 "OPENBILICLAW_FULL_WORKER": "1",
             }
-            recommendation_process = _subprocess.Popen(
-                [
-                    sys.executable,
-                    "-m",
-                    "openbiliclaw.recommendation_server",
-                ],
-                cwd=os.getcwd(),
-                env=recommendation_env,
+            recommendation_process = _spawn_background_child(
+                "recommendation", "openbiliclaw.recommendation_server", recommendation_env
             )
             _print_status_panel(
                 "info",
@@ -1260,16 +1302,8 @@ def _run_api_server(*, host: str = "127.0.0.1", port: int = 8420) -> None:
 
         # Dedicated image proxy process: image fetching/compression lives here,
         # so it cannot squeeze recommendation serving / reshuffle / chat APIs.
-        import subprocess
-
-        image_service_process = subprocess.Popen(
-            [
-                sys.executable,
-                "-m",
-                "openbiliclaw.image_service",
-            ],
-            cwd=os.getcwd(),
-            env={**os.environ},
+        image_service_process = _spawn_background_child(
+            "image-service", "openbiliclaw.image_service", {**os.environ}
         )
         _print_status_panel(
             "info",
@@ -1277,12 +1311,8 @@ def _run_api_server(*, host: str = "127.0.0.1", port: int = 8420) -> None:
             f"已启动独立 image-proxy pid={image_service_process.pid}（端口 8421）",
         )
         # Main API forwards image requests to this local service.
-        image_service_port = os.environ.get(
-            "OPENBILICLAW_IMAGE_SERVICE_PORT", "8421"
-        )
-        os.environ["OPENBILICLAW_IMAGE_SERVICE_URL"] = (
-            f"http://127.0.0.1:{image_service_port}"
-        )
+        image_service_port = os.environ.get("OPENBILICLAW_IMAGE_SERVICE_PORT", "8421")
+        os.environ["OPENBILICLAW_IMAGE_SERVICE_URL"] = f"http://127.0.0.1:{image_service_port}"
 
         listeners = create_wildcard_listener_sockets(host, port)
         if listeners is None:
@@ -1296,6 +1326,10 @@ def _run_api_server(*, host: str = "127.0.0.1", port: int = 8420) -> None:
         finally:
             close_listener_sockets(listeners)
     finally:
+        # 先恢复原 SIGTERM 处理器再清理:清理最长 ~20s,期间再次收到
+        # SIGTERM 应走默认处置立即退出,而不是在 finally 里再抛异常
+        # 打断剩余子进程的 terminate。
+        restore_sigterm_handler()
         if recommendation_process is not None:
             recommendation_process.terminate()
             try:
@@ -1910,6 +1944,7 @@ _PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
     "orcarouter": {"base_url": "https://api.orcarouter.ai/v1", "model": "openai/gpt-4o"},
     # Requesty: OpenAI-compatible LLM gateway.
     "requesty": {"base_url": "https://router.requesty.ai/v1", "model": "openai/gpt-4o-mini"},
+    "api_route": {"base_url": "https://global.api-route.com/v1", "model": "gpt-5.5"},
 }
 
 
@@ -1922,6 +1957,7 @@ _PROVIDER_HINTS: dict[str, str] = {
     "openrouter": "OpenRouter 聚合",
     "orcarouter": "OrcaRouter 聚合（OpenAI 兼容协议）",
     "requesty": "Requesty 聚合（OpenAI 兼容协议）",
+    "api_route": "API Route 聚合（OpenAI 兼容协议）",
 }
 
 
@@ -1962,6 +1998,7 @@ _PROVIDER_MODEL_HINT: dict[str, str] = {
         "默认 openai/gpt-4o-mini。Requesty 模型名格式: <vendor>/<model>,"
         "如 anthropic/claude-sonnet-4-5 / google/gemini-2.5-flash"
     ),
+    "api_route": "默认 gpt-5.5。也可填写 API Route 支持的其他模型 ID。",
     "ollama": (
         "常见模型: qwen2.5:7b (默认 / 中文好) / llama3.2 (Meta 新版) / "
         "gemma2 (Google) / mistral (轻量) / deepseek-r1 (开源推理)。"
@@ -2463,6 +2500,7 @@ _SUPPORTED_PROVIDERS: tuple[str, ...] = (
     "openrouter",
     "orcarouter",
     "requesty",
+    "api_route",
 )
 
 
@@ -2520,6 +2558,11 @@ _LLM_MENU: tuple[tuple[str, str, str], ...] = (
         "requesty",
         "Requesty 聚合",
         "默认 openai/gpt-4o-mini。一个 Key 跑多家模型,按调用计费",
+    ),
+    (
+        "api_route",
+        "API Route 聚合",
+        "默认 gpt-5.5。一个 Key 跑多家模型,按调用计费",
     ),
 )
 
@@ -2955,7 +2998,7 @@ def _interactive_embedding_setup(default_provider: str, *, auto_if_ready: bool =
             .strip()
             .lower()
         )
-        if target not in _SUPPORTED_PROVIDERS or target in {"orcarouter", "requesty"}:
+        if target not in _SUPPORTED_PROVIDERS or target in {"orcarouter", "requesty", "api_route"}:
             console.print("[red]未知或没有 embedding 接口的 provider,跳过 embedding 配置。[/red]")
             return
         defaults = _PROVIDER_DEFAULTS.get(target, {})

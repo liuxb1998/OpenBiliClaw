@@ -715,6 +715,25 @@ def test_supports_image_input_recognizes_requesty_vision_route() -> None:
     assert service.supports_image_input("discovery.evaluate_batch") is True
 
 
+def test_supports_image_input_recognizes_api_route_vision_route() -> None:
+    class ApiRouteRegistry:
+        default_provider = "api-route-main"
+
+        def provider_type(self, name: str | None = None) -> str:  # noqa: ARG002
+            return "api_route"
+
+        def get(self, name: str) -> object:  # noqa: ARG002
+            return _ModelStub("openai/gpt-4o-mini")
+
+    service = LLMService(
+        registry=ApiRouteRegistry(),  # type: ignore[arg-type]
+        memory=None,  # type: ignore[arg-type]
+        module_overrides=module_overrides_from_config(_native_config()),
+    )
+
+    assert service.supports_image_input("discovery.evaluate_batch") is True
+
+
 class _ModelStub:
     def __init__(self, model: str) -> None:
         self._model = model

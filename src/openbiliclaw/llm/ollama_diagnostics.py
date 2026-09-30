@@ -162,9 +162,7 @@ def _looks_like_native_access_violation(text: str) -> bool:
     claiming it is only a download problem.
     """
     lower = text.lower()
-    return "0xc0000005" in lower or (
-        "access violation" in lower and "llama" in lower
-    )
+    return "0xc0000005" in lower or ("access violation" in lower and "llama" in lower)
 
 
 def _format_gib(value: int) -> str:

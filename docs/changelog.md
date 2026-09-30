@@ -39,6 +39,74 @@
 - **审批与配置事务**：hard_write 参数先校验再生成审批；系统管家对明确修改请求直接生成审批卡，执行仍以卡片批准为准。配置写入前验证运行时合同，无效 provider、非有限数字和私有字段被拒绝；生产写入统一经过设置事务队列，等待实际应用结果，失败回滚且审批显示失败，成功修订更新后续回滚基线。热重载状态显示实际等待阶段；兼容嵌入调用在重载失败后补偿磁盘和运行时。相对路径及符号链接下复用同一审批存储，避免配置生效后卡片状态回退。三端审批轮询保留拒绝理由、焦点与选区。
 - **确认列表性能**：保持模糊去重结果与顺序不变，增加相似度上界剪枝和按完整标题输入的缓存；一次查询会话内已打开的确认，替代逐条 SQLite 查询。319 条真实待确认下单次轮询从约 4.66 秒降至热缓存 29–45 毫秒。
 - **验收**：真实模型、真实数据副本和浏览器联调记录见 [聊一聊真实环境验收](testing/2026-09-26-chat-agent-live-audit.md)；同步 agent/api/soul、三端模块文档与架构图。
+## 修复：dialogue 布局 e2e 剩余滚轮固定等待收口（2026-09-30，fix/e2e-wheel-wait）
+
+- **`test_pending_inbox_is_bounded_and_independently_scrollable` 同款 flake 收口（纯测试）**：与 `fix/e2e-stability` 修过的 `test_many_dialogue_cards_keep_natural_height_and_scroll` 完全相同的模式——`mouse.wheel` 后固定 `wait_for_timeout(80)` 断言 `#desktopPendingConfirmations` 的 `scrollTop` 前进，headless Chromium 滚轮滚动由合成器异步落地，固定等待会早采样。同样改为 `wait_for_function` 轮询到 `scrollTop` 真正前进再断言；至此该文件内 wheel-scroll 断言的固定等待全部消除，连跑 5 遍全绿。
+
+## 修复：推荐进程 TCP 端口占用冲突无探测（2026-09-30，fix/recommendation-port-probe）
+
+- **回退 TCP 时递增探测空闲端口（现场故障后续）**：上一修复把超长 Unix socket 路径回退到固定 `127.0.0.1:8423`，但同机第二个实例同样回退（或 8423 被别的程序占用）时子进程 bind 失败，又回到 `Recommendation proxy failed: All connection attempts failed`。现 `recommendation_runtime.find_free_loopback_port()` 从基准端口（显式 `OPENBILICLAW_RECOMMENDATION_PORT` 或 8423）起逐个真实 bind 探测，被占递增、有界 21 个候选，最终选中端口写回 env，父进程反代与子进程读同一变量天然一致；Windows 主路径（本就走 TCP）同样受益。**显式端口语义**：被占时同样递增而非硬失败，并记 WARNING 说明原值与改选结果——该端口是纯内部 loopback IPC，唯一消费者是读同一 env 的自家反代，硬失败只会复现推荐页 502；非法端口值 WARNING 后按默认端口探测。探测耗尽保留基准端口并 WARNING，子进程新增 `_run_tcp` 在 bind 失败时记含端口号的清晰 ERROR（覆盖探测到 bind 之间的小概率竞态）。独立运行 `recommendation_server` 的超长路径兜底分支同样先探测。回归：`tests/test_recommendation_runtime.py` +8 条（探测跳过被占端口且选中端口可绑、有界扫描耗尽返回 None、默认端口被占时 TCP 分支递增且 env 一致、显式端口被占递增 + WARNING 语义、耗尽保留基准 + WARNING、超长路径回退也探测、子进程 bind 失败 ERROR 日志、独立运行回退探测）。
+- **文档同步**：`docs/modules/cli.md`（start 传输选择段补端口探测与显式端口语义）、`docs/modules/api.md`（反代传输说明补端口探测）。
+
+## 修复：Responses API flavor 缺 length 截断自愈（2026-09-30，fix/responses-length-retry）
+
+- **Responses 路径补齐预算放大重试（chat 修复的 flavor 补齐）**：`c36cff5a` 给 chat-completions 路径加的 `finish_reason=length` 翻倍预算重试未覆盖 `api_flavor="responses"` 实例——Responses 端点以 `status="incomplete"` + `incomplete_details.reason="max_output_tokens"` 表达输出截断，此前只在空 `content` 时用**相同预算**去掉 `text.format` 重试，reasoning 模型会再次把预算烧在思考上。现 `_complete_via_responses()` 获得等价自愈：① json_mode 下 JSON 被截断但有正文时翻倍 `max_output_tokens` 重试一次；② 空 `content` 走完「去 text.format」重试梯后仍是 `incomplete/max_output_tokens` 时翻倍重试一次。既有 `_chat_retry_with_larger_budget()` 泛化为共享的 `_retry_with_larger_budget()`（预算键 / 截断标记 / 发送函数参数化，封顶逻辑单一出处），新增 `_responses_output_truncated()` 判定，封顶同为 32768、已达上限不重试、重试保留其余请求参数、仍失败时抛与此前一致的 `returned empty content` 错误，下游回退行为不变。回归：`tests/test_llm_providers.py` +4 条（截断 JSON 放大重试成功且参数保留、空 content 梯后放大重试成功、重试耗尽错误与回退不变、已达封顶不重试）。
+- **文档同步**：`docs/modules/llm.md`（「finish_reason=length 预算放大重试」行扩为两条 flavor）。
+
+## 修复：桌面 web e2e 稳定性（2026-09-30，fix/e2e-stability）
+
+- **pool_refill 稳定性 e2e 按真实线上事件格式注入（测试过期，非产品 bug）**：`tests/test_desktop_web_list_stability_e2e.py::test_pool_refill_event_keeps_loaded_cards_and_scroll_position` 在干净 main 上稳定红，末条断言 `#metricPool == "70"` 不成立（实为 40）。根因：自 `408de9a8` 起头部库存只跟随带 `pool_status_version` 的已提交库存快照（`normalizeRuntimeStatus` 优先 `state.platformAvailability.total_available`，无版本事件的裸 `pool_available_count` 不再驱动头部），而测试注入的 `refresh.pool_updated` 缺 `pool_status_version` / `platform_available_counts`。产品行为正确（防 HTTP/WebSocket 竞态下旧快照覆盖新快照），故按真实后端 `_broadcast_recommendation_pool_status` 的线上格式补全注入字段，断言与 DOM 原地存活 / 滚动位置契约保持不变。
+- **dialogue 布局 e2e 滚轮 flake 改确定性等待**：`tests/test_desktop_dialogue_layout_e2e.py::test_many_dialogue_cards_keep_natural_height_and_scroll` 的 `mouse.wheel` 后固定 `wait_for_timeout(80)` 在并行负载下会早采样到 `scrollTop=0`（headless Chromium 滚轮滚动由合成器异步落地，实测延迟可超 80ms、随后正常到位），改为 `wait_for_function` 轮询到 `scrollTop` 真正前进再断言，连跑 5 遍全绿。
+
+## 修复：数据目录过深时推荐子进程 AF_UNIX 路径超限崩溃（2026-09-30，fix/recommendation-socket-fallback）
+
+- **Unix socket 路径超限自动回退 TCP（现场故障）**：推荐子进程与主 API 之间的 Unix socket 路径由 `<data_dir>/runtime/recommendation.sock` 直接拼接，macOS 上 `sun_path` 上限约 104 字节，数据目录稍深子进程启动即以 `OSError: AF_UNIX path too long` 崩溃，API 侧随后报 `Recommendation proxy failed: All connection attempts failed`（生产日志 2026-09-28 出现 4 次）。现 `recommendation_runtime.ensure_recommendation_transport_env()` 在选 Unix socket 前对最终路径（含显式 `OPENBILICLAW_RECOMMENDATION_SOCK`）做字节长度检查，达到 104 字节（含 NUL，按最严 POSIX 平台计）即自动回退 loopback TCP（默认 `127.0.0.1:8423`）并记一条 WARNING（含实际路径长度与所选端口）；传输仍由父进程环境变量单一决定，子进程与 API 反代读同一组变量，双方始终一致。独立直接运行 `openbiliclaw.recommendation_server`（无继承环境变量）时同样的长度检查在进程内兜底，不再崩溃。Windows 行为不变（本就走 TCP）。回归：`tests/test_recommendation_runtime.py` +5 条（长度边界、超长派生路径回退 TCP 且 WARNING 含长度/上限/端口、超长显式 SOCK 回退、ensure 与 server 经共享 env 同选 TCP、server 独立运行超长路径兜底 TCP）。
+- **文档同步**：`docs/modules/cli.md`（start 四进程段落补传输选择与回退规则）、`docs/modules/api.md`（推荐反代小节补传输一致性说明）、`docs/architecture.md`（系统概览数据流标注回退）。
+
+## 修复：reasoning 模型 length 截断导致关键词 planner 持续回退（2026-09-30，fix/keyword-planner-length-retry）
+
+- **`finish_reason=length` 预算放大重试（核心，现场故障）**：生产 7~9 月日志中 `keyword planner merged generation failed; falling back to interest names` 出现 21+ 次，搜索词质量下降。根因：配置了 `reasoning_effort` 的 OpenAI 兼容端点把输出预算全部耗在 thinking 上，响应以 `finish_reason=length` 结束——要么 `content` 为空（reasoning-only），要么 JSON 被截断。既有自愈路径都覆盖不到：「去掉 `response_format` 重试」用同一 `max_tokens` 重发必然再次 length；「显式禁 thinking 重试」只在调用方显式传 `reasoning_effort=""` 时触发，而 planner 等路由传 `None` 跟随实例配置。现 `OpenAIProvider.complete()`（chat-completions 路径，全部 OpenAI 协议子类继承）在两种 length 截断下各追加一次翻倍预算重试（封顶 32768，已达上限则不重试）：① 空 `content` 走完既有重试梯后仍为 length；② json_mode 下 JSON 被截断但有正文。重试保留原请求其余参数；仍失败时抛出与此前一致的 `returned reasoning but no final content (finish_reason=length)` 错误，planner 及 soul / discovery / recommendation / evaluation 各路由的回退行为不变。回归：`tests/test_llm_providers.py` +4 条（reasoning-only 放大重试成功且参数正确、截断 JSON 放大重试、重试耗尽后错误与回退不变、已达封顶不重试）。
+- **文档同步**：`docs/modules/llm.md`（新增「finish_reason=length 预算放大重试」行）。
+
+## 修复：移动端播放画质选择（2026-09-30）
+
+- B 站 DASH 取流先匹配请求的画质编号，再在该画质内优先选择指定编码。修复真实 iOS 播放中请求 480P（qn=32）却因选择首个 AVC 候选而返回 1080P（qn=80）的问题；目标画质不可用时沿用原有回退行为。
+- 补充覆盖多画质 / 多编码候选、编码偏好和不可用画质回退的回归测试。
+- 验证：相关 pytest 56 项、全仓 Ruff、295 个源码文件的 MyPy 通过；本机真实后端与 iOS 26.5 模拟器端到端验证请求 qn=32 后实际解码 850×480，并继续播放超过三秒。
+
+## 修复：failed_eval 死信无复活路径 + pool maintenance 不变量测量噪声自锁（2026-09-30，fix/pool-eval-recovery）
+
+- **failed_eval 死信复活（核心，现场故障）**：某 Windows 用户 7 月 deepseek 401/404 配置错误把 568 条候选的评估预算烧进 `failed_eval`，此后 provider 修好这批候选也没有任何回到 `pending_eval` 的路径，候选池只出不进。新增 `Database.revive_failed_eval_candidates(limit=500, max_revives=3)`（重置 status / `eval_attempts` / `batch_eval_attempts` / `eval_error` 与 claim 字段，`temporal_review_due:*` 行归 temporal 复审机制所有不参与）；`CandidateEvalCoordinator` 新增 `revive_failed_eval_callback`，在恢复信号（config rebuild 后的 `startup`、`config_*` / `manual_*` 唤醒，即解除 paused 的同一组 reason）触发一次复活，经 `DiscoveryCandidatePipeline.revive_failed_eval_candidates()` 委托到 storage。有界性两层保证：单次最多 `limit` 行 + 每候选持久化 `eval_revive_count` 终生最多复活 `max_revives` 次，对着仍然坏掉的 provider 反复重启不会无限重烧 LLM 配额。复活失败只记 WARNING，不影响唤醒路径。回归：`tests/test_failed_eval_revival.py` 11 条（状态/预算重置、单次限量、持久化复活上限、temporal 行跳过、coordinator 触发时机与异常隔离、pipeline 委托）。
+- **pool maintenance 不变量测量噪声自锁（liveness，现场故障）**：同一现场 8 月每 tick 回滚 652 次（`available inventory fell below protected floor: before=263 after=251 target=300`）。根因不是真实库存下降，而是事务内 before/after 两次 canonical availability 扫描测量基准不一致：`_filter_available_pool_candidate_rows` 每次取新的 `datetime.now(UTC)`（跨 `temporal_valid_until` 的行在中途翻转），动态 delight 阈值每次按当前样本分位重算（事务自身的 `pool_status` 写入会移动样本），池子低于 target 时 floor=`min(before, target)`=before，任何 1 行噪声都整笔回滚——stale 清不掉、suppressed 恢复不了。现 `maintain_pool_inventory` 在事务开始时捕获一次 `maintenance_now`、temporal transition 后快照一次 delight 阈值，两次扫描、恢复规划与全部 trim planner 经 `_now=` / `_delight_threshold=` 私有参数共享这组基线（缺省保持逐次实时计算的旧行为）；stale trim 的 `datetime('now')` 也改为按同一基线计算 cutoff。不变量本身保留不变。回归：`tests/test_pool_maintenance.py` +3 条（时钟跨越 temporal 边界时池低于 target 也能提交、动态阈值每事务只算一次、回滚如实填报——三条在 main 上均为红）。
+- **回滚结果如实填报 + 日志降级**：回滚分支的 `PoolMaintenanceResult` 此前返回默认 `mutation_count=0 / trimmed_*=0`，掩盖事务内真实尝试的写操作；现 `trimmed_*` / `deferred_*` / `mutation_count` 如实描述已被回滚的尝试批次（`available_after` / `raw_after` / `recovered_suppressed` 仍描述回滚后的持久态），`has_more` 固定 `False`。`_record_pool_maintenance_result` 把回滚从 ERROR 降为 WARNING（库存护栏的正常自愈路径；真正异常的 `bounded pool maintenance failed` 保持 ERROR），日志中回滚批次标注 `mutations=N(attempted)`。回归：`tests/test_pool_maintenance.py` +1（回滚字段与持久态不变）、`tests/test_refresh_runtime.py` +2（WARNING/INFO 级别与 attempted 标注）。
+- **文档同步**：`docs/modules/storage.md`（复活 API、共享测量基准、回滚字段语义）、`docs/modules/runtime.md`（`notify` 复活触发、回滚 WARNING、coordinator 装配）、`docs/modules/discovery.md`（pipeline 复活委托）。
+
+## 修复：Firefox event page 卸载导致抖音任务无结果、标签页残留（2026-09-29，fix/issue140-dy-firefox-task-state）
+
+- **抖音任务状态持久化 + alarm 超时兜底（issue #140，严重）**：Firefox MV3 的 background scripts 是 event page，空闲约 30 秒即被浏览器卸载；`dy-task-dispatcher.ts` 此前把任务执行状态（`taskTabId` / `searchProgress` 等）全部放在模块级内存，超时兜底用模块级 `setTimeout`——event page 卸载后超时回调不再触发、任务标签页残留，迟到的 `DY_SEARCH_RESULT` 也被 `if (!searchProgress) return` 丢弃。现把进行中任务的快照（任务体、任务 tab id、deadline、各类型进度）在每次状态迁移时串行写穿到 `chrome.storage.session`（key `openbiliclaw_dy_active_task`），超时改用一次性 `chrome.alarms`（`openbiliclaw-dy-task-timeout`）作为权威兜底，`setTimeout` 仅作同进程精确快速路径。新 worker 经 `ensureDyTaskRecovery()` 单例 barrier（service worker 启动、poll/超时 alarm、`DY_*_RESULT` 消息入口共用）恢复快照：迟到结果继续回传 partial/final 并收尾，过期记录补报 `failed + task_timeout` 并关闭任务 tab，tab 已消失时以 `task_tab_closed` 立即结算；无记录时按 `openbiliclaw_dy_task=1` URL 标记清扫孤儿任务标签页（不动用户标签）。Chrome service worker 回收场景同样受益。回归：新增 `extension/tests/dy-task-recovery.test.ts` 8 条。
+- **文档同步**：`docs/modules/extension.md`（新增「抖音任务状态跨 event page 持久化」行）。
+
+## 新增 API Route 内置 Provider（2026-09-28，feat/api-route-provider）
+
+- `provider_type="api_route"` 通过 OpenAI 兼容接口接入 API Route，默认 `https://global.api-route.com/v1`、`gpt-5.5`。支持独立实例、调用链、模型发现和请求探测；多模型路由不发送 `reasoning_effort`，embedding 仍需独立配置。
+- 接入后端配置与 API、CLI 和安装向导、桌面与扩展设置、首次设置向导；补充配置样例、文档和回归测试。只有用户显式配置时才会调用。
+- 用量估价按 API Route 当前公开费率计算默认 `gpt-5.5`，其他路由使用网关中档估算值。
+
+## 修复：Windows pythonw 下子进程标准流缺失导致推荐页 502（2026-09-26，fix/pythonw-child-stdio）
+
+- **子进程 stdout/stderr 显式落盘（严重）**：Windows 桌面包用 `pythonw.exe`（无控制台）跑 `cli start`，`_run_api_server` 此前用 `subprocess.Popen([sys.executable, "-m", ...])` 拉起 4 个后台子进程但不传 stdout/stderr；Windows 上 Python 默认 `close_fds=True`，子 `pythonw` 的 `sys.stdout`/`sys.stderr` 为 `None`，`recommendation_server` 与 `image_service` 一写标准流就抛异常静默退出（stderr 同为 None，连堆栈都留不下），推荐页因此 502 空白。现统一走新辅助函数 `cli._spawn_background_child(name, module, env)`，把每个子进程的 stdout/stderr 重定向到 `logs/child-<name>.log`（append，utf-8）；这些文件落在 `logging_setup` 既有 unmanaged 清理策略内（超 200MB 截断、超 30 天删除、总预算 500MB）。回归：`tests/test_cli_child_stdio.py` 3 条（重定向参数与日志路径、命名、Popen 失败时句柄不泄漏）。
+- **迁移运行时锁 Windows 分支 PermissionError**：`storage/migration.py` `_try_acquire_runtime_lock` 的 `os.name == "nt"` 分支此前在 `msvcrt.locking` 上锁前先 `handle.read(1)`，锁已被别的实例持有时 Windows 在 read 这一步直接抛 PermissionError，第二个实例以回溯崩溃退出而不是走「检测到已有实例在运行」的优雅分支。现把 seek/read/write/lock 整段抽为 `_windows_runtime_lock`，任一步 OSError 都关闭句柄并返回 None。回归：同文件 3 条（成功上锁、read 抛 PermissionError、locking 失败）。
+- **文档同步**：`docs/modules/cli.md`（子进程控制台输出落盘 `logs/child-*.log` 及清理策略）。
+
+## 修复：SIGTERM 退出留下四个孤儿子进程（2026-09-27，fix/sigterm-child-orphans）
+
+- **SIGTERM 下 finally 不执行（严重）**：`openbiliclaw start` / `serve-api` 的 `_run_api_server` 在 finally 里 terminate 四个后台子进程（worker / discovery_worker / recommendation_server / image_service），但实测 SIGTERM（`docker stop` / `pkill` / launchd / systemd）下 finally 从未执行，子进程变成 PPID=1 的孤儿继续占用端口。根因是 uvicorn `Server.capture_signals`：退出时恢复"原始"信号处理器并 `raise_signal` 重发捕获信号——SIGINT 重发后变成 KeyboardInterrupt 能穿过 finally，SIGTERM 重发后落到 SIG_DFL 进程立即死亡。现 `_run_api_server` 在 uvicorn 启动前安装 `_install_sigterm_cleanup_hook()`（SIGTERM 处理器抛 `SystemExit(143)`），uvicorn 保存/恢复的"原始处理器"即该钩子，重发时异常穿过 finally 完成子进程清理并以约定退出码 143 退出；外层 finally 先恢复原处理器再做清理（清理期间再次 SIGTERM 走默认处置立即退出），两条 uvicorn 启动路径（`uvicorn.run` / `server.run`）均覆盖；仅主线程安装，非主线程为 no-op。SIGINT 行为不变。回归：`tests/test_cli_sigterm.py` 4 条（钩子退出码、安装/恢复、非主线程 no-op、subprocess 模拟 uvicorn restore+raise_signal 全链路断言退出码 143 且清理标记写出）。
+- **文档同步**：`docs/modules/cli.md`（start 进程段落补 SIGTERM 清理说明）。
+
+## 设计文档：推荐导演规格收口（2026-09-26）
+
+- **Jev 三模式架构增补（仅文档）**：新增 [逐对编排 / Agent+Jev 局部修正 / 纯 Agent 预编排方案](plans/2026-09-26-director-jev-modes.md) 与 [官方能力核实](plans/2026-09-26-jev-provider-research.md)，明确每次选两张卡、独立过滤 provider、应用层递归状态、未来草稿中间换卡后的后缀重验、整屏提交和分别计量的预算/归因。原单模式规格标明被替代条款；未接入服务、未调用付费 API，运行时代码与配置不变。
+- **补全可实施合同（仅文档）**：为推荐导演规格补齐确定性 Feedback Gate 阈值与版本、规划和请求并发活性、Batch 执行类型与回退归因、状态变更事件账本、slot 失败释放、DELIVERED 重规划、Phase 0A 反馈身份桥及不隐藏失败样本的工程验收门；当前推荐行为和配置未变化。
 
 ## 修复：移动端聊一聊 SSE 僵尸流假死（2026-09-25，fix/mobile-stream-watchdog）
 

@@ -7,7 +7,13 @@ from dataclasses import dataclass, field
 
 import pytest
 
-from openbiliclaw.config import Config, EmbeddingConfig, LLMConfig, LLMProviderConfig
+from openbiliclaw.config import (
+    Config,
+    EmbeddingConfig,
+    LLMConfig,
+    LLMInstanceConfig,
+    LLMProviderConfig,
+)
 from openbiliclaw.llm.base import (
     LLMFallbackError,
     LLMProvider,
@@ -193,6 +199,44 @@ def test_build_llm_registry_registers_requesty() -> None:
     provider = registry.get("requesty")
     assert provider.name == "requesty"
     assert provider.base_url == "https://router.requesty.ai/v1"
+
+
+def test_build_llm_registry_registers_api_route() -> None:
+    config = Config(
+        llm=LLMConfig(
+            default_provider="api_route",
+            api_route=LLMProviderConfig(api_key="test-key"),
+        )
+    )
+
+    registry = build_llm_registry(config)
+
+    assert registry.default_provider == "api_route"
+    assert registry.get("api_route").base_url == "https://global.api-route.com/v1"
+    assert registry.get("api_route")._model == "gpt-5.5"
+
+
+def test_build_llm_registry_registers_api_route_instance() -> None:
+    config = Config(
+        llm=LLMConfig(
+            instance_routing=True,
+            instances={
+                "api-route-main": LLMInstanceConfig(
+                    name="API Route",
+                    provider_type="api_route",
+                    api_key="test-key",
+                    model="gpt-5.5",
+                )
+            },
+            default_chain=["api-route-main"],
+        )
+    )
+
+    registry = build_llm_registry(config)
+
+    assert registry.default_provider == "api-route-main"
+    assert registry.get("api-route-main").name == "api_route"
+    assert registry.get("api-route-main").base_url == "https://global.api-route.com/v1"
 
 
 def test_build_llm_registry_omits_requesty_without_api_key() -> None:

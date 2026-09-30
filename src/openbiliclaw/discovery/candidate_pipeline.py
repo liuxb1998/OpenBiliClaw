@@ -709,6 +709,22 @@ class DiscoveryCandidatePipeline:
         )
         return len(ids)
 
+    def revive_failed_eval_candidates(self) -> int:
+        """Re-queue dead-lettered candidates after an evaluator recovery.
+
+        Delegates to storage with the same getattr guard style as the other
+        durable hooks so test doubles without the method keep working.
+        """
+
+        revive = getattr(self.database, "revive_failed_eval_candidates", None)
+        if not callable(revive):
+            return 0
+        try:
+            return int(revive() or 0)
+        except Exception:
+            logger.debug("failed_eval candidate revival failed", exc_info=True)
+            return 0
+
     async def _drain_pending_locked(
         self,
         *,

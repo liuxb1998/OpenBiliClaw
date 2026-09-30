@@ -41,10 +41,7 @@ def test_bilibili_auth_export_returns_cookie_and_meta(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
-    cookie = (
-        "SESSDATA=secret; bili_jct=csrf; "
-        "buvid3=buvid-value-3; DedeUserID=123"
-    )
+    cookie = "SESSDATA=secret; bili_jct=csrf; buvid3=buvid-value-3; DedeUserID=123"
     with _client(monkeypatch, tmp_path, cookie=cookie) as client:
         response = client.post("/api/bilibili/auth/export", json={})
     assert response.status_code == 200

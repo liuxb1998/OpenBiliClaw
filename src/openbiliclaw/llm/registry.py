@@ -10,6 +10,7 @@ from typing import TYPE_CHECKING, Any
 
 from openbiliclaw import network
 
+from .api_route_provider import ApiRouteProvider
 from .base import LLMProvider, LLMProviderError, LLMRegistry
 from .claude_provider import ClaudeProvider
 from .dashscope_provider import DashScopeEmbeddingProvider
@@ -68,6 +69,7 @@ def build_llm_registry(
         ("orcarouter", _maybe_orcarouter_provider(config, overrides)),
         ("openai_compatible", _maybe_openai_compatible_provider(config, overrides)),
         ("requesty", _maybe_requesty_provider(config, overrides)),
+        ("api_route", _maybe_api_route_provider(config, overrides)),
     ]
 
     for _name, provider in provider_specs:
@@ -224,6 +226,7 @@ def _build_instance_provider(
         "openrouter": _maybe_openrouter_provider,
         "orcarouter": _maybe_orcarouter_provider,
         "requesty": _maybe_requesty_provider,
+        "api_route": _maybe_api_route_provider,
         "openai_compatible": _maybe_openai_compatible_provider,
     }
     factory = factories.get(provider_type)
@@ -985,6 +988,26 @@ def _maybe_requesty_provider(
         proxy=_outbound_proxy(base_url),
         trust_env=_outbound_trust_env(base_url),
         reasoning_effort=config.llm.requesty.reasoning_effort,
+    )
+
+
+def _maybe_api_route_provider(
+    config: Config, overrides: dict[str, LLMProvider]
+) -> LLMProvider | None:
+    if "api_route" in overrides:
+        return overrides["api_route"]
+    cfg = config.llm.api_route
+    if not cfg.api_key.strip():
+        return None
+    base_url = cfg.base_url or "https://global.api-route.com/v1"
+    return ApiRouteProvider(
+        api_key=cfg.api_key,
+        model=cfg.model or "gpt-5.5",
+        base_url=base_url,
+        timeout=float(config.llm.timeout),
+        proxy=_outbound_proxy(base_url),
+        trust_env=_outbound_trust_env(base_url),
+        reasoning_effort=cfg.reasoning_effort,
     )
 
 

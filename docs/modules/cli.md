@@ -352,7 +352,11 @@ $ openbiliclaw start --host 0.0.0.0 --port 9000
 
 适合本地直接运行或调试场景。若只希望本机访问，把 `[api].host` 改为 `127.0.0.1`，或启动时传 `--host 127.0.0.1`。
 
-默认使用四进程后台模式：主 API 之外会拉起 `full worker`、`discovery worker`、独立推荐进程和独立图片代理。需要回退到旧的单 API 进程模式时，设置 `OPENBILICLAW_WORKER=0`（`false` / `no` / `off` 也可）。
+默认使用四进程后台模式：主 API 之外会拉起 `full worker`、`discovery worker`、独立推荐进程和独立图片代理。需要回退到旧的单 API 进程模式时，设置 `OPENBILICLAW_WORKER=0`（`false` / `no` / `off` 也可）。退出时（含 SIGINT 与 SIGTERM，如 `docker stop` / `pkill` / launchd / systemd）主进程都会 terminate 并回收这四个子进程，不会留下孤儿。
+
+独立推荐进程的传输由 `recommendation_runtime.ensure_recommendation_transport_env()` 在拉起子进程前决定并写入环境变量，主 API 反代与子进程读同一组变量，天然一致：Windows 或显式 `OPENBILICLAW_RECOMMENDATION_PORT` 走 loopback TCP；POSIX 默认用 `<data_dir>/runtime/recommendation.sock`（或显式 `OPENBILICLAW_RECOMMENDATION_SOCK`）Unix socket，但当最终 socket 路径字节长度达到 AF_UNIX `sun_path` 上限（按最严平台 104 字节含 NUL 计，macOS 数据目录稍深即触发）时自动回退 loopback TCP（默认 `127.0.0.1:8423`）并记一条 WARNING（含实际路径长度与所选端口），不再让子进程以 `OSError: AF_UNIX path too long` 崩掉。独立直接运行 `openbiliclaw.recommendation_server`（无继承环境变量）时同样的长度检查在进程内兜底。选 TCP 时父进程会从基准端口（显式值或 8423）起逐个真实 bind 探测，被占则递增（有界 21 个候选），把最终选中的空闲端口写回 `OPENBILICLAW_RECOMMENDATION_PORT`，同机第二个实例因此不会再因 8423 冲突起不来；显式端口被占时同样递增并记 WARNING 说明改选结果（该端口只是内部 loopback IPC，唯一消费者是读同一 env 的反代，硬失败只会复现推荐页 502）；探测耗尽则保留基准端口并 WARNING，由子进程 `_run_tcp` 在 bind 失败时记一条含端口号的 ERROR。探测到子进程 bind 之间存在小概率被抢的竞态，该 ERROR 日志即为此准备。
+
+四个子进程的 stdout/stderr 会显式重定向落盘到 `logs/child-{worker,discovery-worker,recommendation,image-service}.log`（append）。这是 Windows 桌面包（`pythonw.exe`，无控制台）的必需行为：不显式传标准流时子进程拿不到任何句柄，一写输出就静默退出。`child-*.log` 按 unmanaged 日志策略清理（单文件超 200MB 截断、超 30 天删除、logs/ 总预算 500MB，见 `logs-prune`）。
 
 `start` 与 `serve-api` 都会先取得项目根和 canonical `data_dir` 的 migration runtime lock；如果存在已校验的 pending 或未完成 journal，会在任何业务数据库访问前完成应用或恢复。锁会持续到后端退出，另一个指向同一数据目录的受支持后端无法并发启动。迁移应用后会重新读取配置并补锁实际运行目录；无法取得任一锁时拒绝启动。
 
@@ -893,6 +897,7 @@ OpenBiliClaw 需要一个语言模型来理解你的兴趣、写推荐文案。
  6   OpenRouter 聚合                       默认 openai/gpt-5-nano。一个 Key 跑多家模型,按调用计费
  7   OrcaRouter 聚合                       默认 openai/gpt-4o。一个 Key 跑 150+ 模型,网关级零信任安全
  8   Requesty 聚合                         默认 openai/gpt-4o-mini。一个 Key 跑多家模型,按调用计费
+ 9   API Route 聚合                        默认 gpt-5.5。一个 Key 跑多家模型,按调用计费
 
 Tip:不确定就选 1 (DeepSeek),¥0.001/千 token 几乎免费,月度通常 ¥0.5-2。已经买了中转站 / OneAPI Key 选 2 (协议兼容)。本地 Ollama 仅用于向量检索(embedding),不作为聊天服务商;如需本地聊天模型请到设置页手动配置。
 

@@ -38,10 +38,7 @@ def test_event_source_schema_is_present_in_fresh_database(tmp_path: Path) -> Non
     assert columns["content_id"] == "''"
     assert columns["source_confidence"] == "'legacy_unknown'"
     assert db.conn.execute("SELECT MAX(version) FROM schema_version").fetchone()[0] == 8
-    indexes = {
-        str(row["name"])
-        for row in db.conn.execute("PRAGMA index_list(events)").fetchall()
-    }
+    indexes = {str(row["name"]) for row in db.conn.execute("PRAGMA index_list(events)").fetchall()}
     assert "idx_events_source_content" in indexes
 
 
@@ -127,9 +124,12 @@ def test_event_source_schema_migrates_legacy_rows_without_overclaiming(
     db.close()
     reopened = Database(path)
     reopened.initialize()
-    assert reopened.conn.execute(
-        "SELECT source_platform, content_id, source_confidence FROM events WHERE id = 1"
-    ).fetchone()["source_platform"] == "xiaohongshu"
+    assert (
+        reopened.conn.execute(
+            "SELECT source_platform, content_id, source_confidence FROM events WHERE id = 1"
+        ).fetchone()["source_platform"]
+        == "xiaohongshu"
+    )
 
 
 def test_event_insert_persists_canonical_source_attribution(tmp_path: Path) -> None:

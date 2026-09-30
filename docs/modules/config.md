@@ -273,7 +273,7 @@ base_url = "https://api.deepseek.com"
 | 键 | 类型 | 默认值 | 说明 |
 |----|------|--------|------|
 | `name` | string | 实例 ID | 设置页显示名称，可重复 |
-| `provider_type` | string | `""` | 适配器类型：`openai` / `claude` / `gemini` / `deepseek` / `ollama` / `openrouter` / `orcarouter` / `requesty` / `openai_compatible` |
+| `provider_type` | string | `""` | 适配器类型：`openai` / `claude` / `gemini` / `deepseek` / `ollama` / `openrouter` / `orcarouter` / `requesty` / `api_route` / `openai_compatible` |
 | `enabled` | bool | `true` | 是否允许注册和引用；停用实例不能留在任何链里 |
 | `api_key` | string | `""` | 此实例自己的凭据；API 默认只回显掩码 |
 | `model` | string | `""` | 此实例固定使用的聊天模型 |
@@ -385,6 +385,18 @@ base_url = "https://api.deepseek.com"
 | `reasoning_effort` | string | `"medium"` | 保留以对齐统一配置面；适配器**不发送** `reasoning_effort` / `reasoning`，推理模型使用自身默认档位 |
 
 > 设置页「获取模型」会先列出 `GET /v1/models/managed` 的托管策略，再合并 `GET /v1/models` 的完整模型目录。Requesty 没有接入 embedding；需要向量化时在 `[llm.embedding]` 独立配置 Ollama / Gemini / OpenAI 等。
+
+#### API Route（`provider_type = "api_route"`）
+
+API Route 是 OpenAI 兼容的多模型网关。可在桌面设置页、首次运行向导、浏览器扩展或 CLI 选择 API Route，创建独立实例并将实例 ID 加入 `default_chain`。API Key 在 [API Route](https://global.api-route.com/) 获取。
+
+| 键 | 默认值 | 说明 |
+|----|--------|------|
+| `api_key` | `""` | API Route API Key；加入调用链时必填 |
+| `model` | `"gpt-5.5"` | 模型 ID，可在设置页获取模型或手填 |
+| `base_url` | `"https://global.api-route.com/v1"` | OpenAI 兼容接口，可覆盖 |
+
+API Route 适配器不发送 `reasoning_effort`，且不提供 embedding；需要向量化时单独配置 `[llm.embedding]`。
 
 #### OpenAI-compatible（`provider_type = "openai_compatible"`）
 
