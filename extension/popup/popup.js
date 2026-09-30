@@ -582,6 +582,7 @@ let offlineBackendPoller = null;
 const backendConnectionCoordinator = createBackendConnectionCoordinator({
   checkBackendStatus,
   onStatusChange(status) {
+    const wasOnline = state.online;
     state.online = status !== "offline";
     setStatus(status);
     if (status === "offline") {
@@ -589,6 +590,12 @@ const backendConnectionCoordinator = createBackendConnectionCoordinator({
       return;
     }
     offlineBackendPoller?.stop();
+    if (!wasOnline && state.activeTab === "chat") {
+      // Chat may have opened before the first health check completed.
+      void refreshChatSkills();
+      void refreshChatPersonas();
+      void refreshChatSessions();
+    }
   },
 });
 offlineBackendPoller = createOfflineBackendPoller({

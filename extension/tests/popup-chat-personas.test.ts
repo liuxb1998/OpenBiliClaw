@@ -128,3 +128,23 @@ test("an old backend that ignores the new field cannot be reported as a successf
   assert.equal(closed(), 0);
   assert.match(statuses[0], /尚未确认/);
 });
+
+test("reconnecting in an already open chat loads its role and persona controls", () => {
+  const calls: string[] = [];
+  const context = vm.createContext({
+    state: { online: false, activeTab: "chat" },
+    offlineBackendPoller: { start() {}, stop() {} },
+    checkBackendStatus() {}, setStatus() {},
+    refreshChatSkills() { calls.push("skills"); },
+    refreshChatPersonas() { calls.push("personas"); },
+    refreshChatSessions() { calls.push("sessions"); },
+    createBackendConnectionCoordinator: (options: unknown) => options,
+  });
+  const start = source.indexOf("const backendConnectionCoordinator =");
+  const end = source.indexOf("\nofflineBackendPoller =", start);
+  vm.runInContext(source.slice(start, end), context);
+  vm.runInContext('backendConnectionCoordinator.onStatusChange("online")', context);
+  assert.deepEqual(calls, ["skills", "personas", "sessions"]);
+  vm.runInContext('backendConnectionCoordinator.onStatusChange("degraded")', context);
+  assert.equal(calls.length, 3, "reachable status changes should not repeat catalog reads");
+});

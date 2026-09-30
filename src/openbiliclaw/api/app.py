@@ -11765,11 +11765,13 @@ def create_app(
                             except Exception:
                                 logger.exception("Failed to apply agent chat effects: %s", turn_id)
             except DialogueLeaseTimeoutError as exc:
-                # Hot reload held the lane past the admission budget. The
-                # loop never started, so keep the durable turn pending and
+                # Hot reload or another reply held the lane past the admission
+                # budget. The loop never started, so keep the durable turn pending and
                 # re-wake the fallback worker: it re-runs the agent loop
                 # (with full agent_events) once the lane resumes.
-                logger.info("Agent stream admission timed out during reload: %s", turn_id or "-")
+                logger.info(
+                    "Agent stream admission timed out: %s (%s)", turn_id or "-", exc.safe_message
+                )
                 if turn_id:
                     chat_reply_scheduler.schedule(turn_id)
                 yield sse("error", {"error": exc.safe_message})

@@ -1027,6 +1027,10 @@ function closeChatPreferences() {
 
 function renderAgentOverlays() {
   const host = ensureAgentOverlayHost();
+  const previousRenameInput = host.querySelector(".agent-session-rename-input");
+  const renameHadFocus = previousRenameInput === document.activeElement;
+  const renameSelection = previousRenameInput
+    ? [previousRenameInput.selectionStart, previousRenameInput.selectionEnd] : null;
   const previousPreferenceFocus = host.querySelector(".agent-preferences-panel :focus");
   const previousPreferenceScroll = host.querySelector(".agent-preferences-panel .agent-drawer-list")?.scrollTop || 0;
   host.innerHTML = "";
@@ -1055,7 +1059,7 @@ function renderAgentOverlays() {
             </div>
             ${sessionRenameId === session.session_id ? `
               <div class="agent-session-rename">
-                <input type="text" class="agent-session-rename-input" value="${esc(session.title || "")}" maxlength="60" placeholder="会话名">
+                <input type="text" class="agent-session-rename-input" data-session-rename-input="${esc(session.session_id)}" value="${esc(session.title || "")}" maxlength="60" placeholder="会话名">
                 <button type="button" class="agent-btn agent-btn-primary" data-session-rename-submit="${esc(session.session_id)}">保存</button>
               </div>` : ""}
           `).join("")}
@@ -1085,7 +1089,7 @@ function renderAgentOverlays() {
         } else if (renameBtn instanceof HTMLElement) {
           sessionRenameId = renameBtn.dataset.sessionRename || "";
           renderAgentOverlays();
-          drawer.querySelector(".agent-session-rename-input")?.focus();
+          host.querySelector(".agent-session-rename-input")?.focus();
         } else if (archiveBtn instanceof HTMLElement) {
           void handleArchiveSession(archiveBtn.dataset.sessionArchive || "");
         } else if (switchBtn instanceof HTMLElement) {
@@ -1094,6 +1098,15 @@ function renderAgentOverlays() {
       }
     });
     host.appendChild(drawer);
+    const renameInput = drawer.querySelector(".agent-session-rename-input");
+    if (renameInput && previousRenameInput?.dataset.sessionRenameInput === sessionRenameId) {
+      // Background session/history refreshes must not replace an unfinished edit.
+      renameInput.value = previousRenameInput.value;
+      if (renameHadFocus) {
+        renameInput.focus({ preventScroll: true });
+        renameInput.setSelectionRange(...renameSelection);
+      }
+    }
   }
 
   if (skillsSheetOpen) {

@@ -347,7 +347,7 @@ row；相同 `turn_id` 的同一 normalized request 仍幂等，任何 relation/
 
 ## 一致性边界
 
-所有生产 `dialogue.respond()` 入口（durable reply、惊喜 chat、legacy `/api/chat`、兴趣探针 chat、避雷探针 chat）共享 app-owned `DialogueExecutionCoordinator`，同一时刻最多一个 active execution。调用方拿到 lease 后才解析当前 `ctx.dialogue` 与对应 Soul speculator，并把回复后的认知、事件与状态副作用一并留在 lease 内。配置热重载先暂停 admission、排空 active execution，才发布新 runtime；等待中的请求恢复后解析新 owner。25 分钟内不能排空时不调用 rebuild，恢复旧 lane 并回滚配置。guided init 的 `resume_execution_lanes=false` 只控制 event lane，不会把独立 chat lane 留在 paused。交互式 agent 流（`/api/chat/agent/stream`）的 lease 准入带 30 秒上限：热重载窗口内不再无限挂起，超时向客户端发 `error` 事件，durable turn 保持 pending 并由兜底 worker 在 lane 恢复后重跑 agent loop 完成；durable worker 与 legacy 路径仍使用无限等待（自带退避重试）。
+所有生产 `dialogue.respond()` 入口（durable reply、惊喜 chat、legacy `/api/chat`、兴趣探针 chat、避雷探针 chat）共享 app-owned `DialogueExecutionCoordinator`，同一时刻最多一个 active execution。调用方拿到 lease 后才解析当前 `ctx.dialogue` 与对应 Soul speculator，并把回复后的认知、事件与状态副作用一并留在 lease 内。配置热重载先暂停 admission、排空 active execution，才发布新 runtime；等待中的请求恢复后解析新 owner。25 分钟内不能排空时不调用 rebuild，恢复旧 lane 并回滚配置。guided init 的 `resume_execution_lanes=false` 只控制 event lane，不会把独立 chat lane 留在 paused。交互式 agent 流（`/api/chat/agent/stream`）的 lease 准入带 30 秒上限：热重载或前一个回复占用通道时不再无限挂起；超时向客户端发 `error` 事件，文案按 paused/active 区分“正在重载配置”与“对话通道正忙”，durable turn 保持 pending 并由兜底 worker 在 lane 恢复后重跑 agent loop 完成；durable worker 与 legacy 路径仍使用无限等待（自带退避重试）。
 
 新 agent chat turn 创建时由服务端冻结 `payload.agent_persona`，客户端提交该保留键返回 422；
 会话随后改风格不改变该回合，SSE 与 durable worker 均使用冻结值，旧 turn 缺省 natural。
