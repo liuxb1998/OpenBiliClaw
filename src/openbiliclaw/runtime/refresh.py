@@ -354,6 +354,14 @@ class ContinuousRefreshController:
     discovery_candidate_pipeline: Any | None = None
     candidate_eval_coordinator: Any | None = None
     expression_copy_coordinator: Any | None = None
+    # Delegated deployment (``openbiliclaw start``): the coordinators above run
+    # in the discovery-worker process, so this process's instances never start
+    # and would report a perpetual idle in runtime-status. When wired by the
+    # composition root, this reader returns the worker's live coordinator
+    # payloads (nested per coordinator) while its status heartbeat is fresh;
+    # ``None`` keeps the local values. See ``_status_store_for`` in
+    # discovery_worker.py for the publishing side.
+    delegated_coordinator_status_reader: Callable[[], dict[str, Any] | None] | None = None
     # OpenClaw's bridge is intentionally one-shot: it has no daemon loop to
     # own ExpressionCopyCoordinator.  When supplied, this callback finishes
     # the durable copy stage synchronously after inline admission instead of
@@ -737,11 +745,33 @@ class ContinuousRefreshController:
         if callable(expression_status):
             with suppress(Exception):
                 payload.update(expression_status())
+        self._overlay_delegated_coordinator_status(payload)
         gate_status_payload = getattr(self.llm_concurrency_gate, "status_payload", None)
         if callable(gate_status_payload):
             with suppress(Exception):
                 payload.update(gate_status_payload())
         return payload
+
+    def _overlay_delegated_coordinator_status(self, payload: dict[str, Any]) -> None:
+        """Overlay the discovery worker's live coordinator payloads, when fresh.
+
+        The worker's payloads use the same key names as the local
+        ``status_payload()`` merges above, so a fresh delegated read simply
+        wins over this process's never-started idle values.
+        """
+        reader = self.delegated_coordinator_status_reader
+        if not callable(reader):
+            return
+        try:
+            delegated = reader()
+        except Exception:
+            logger.debug("delegated coordinator status read failed", exc_info=True)
+            return
+        if not isinstance(delegated, dict):
+            return
+        for nested in delegated.values():
+            if isinstance(nested, dict):
+                payload.update(nested)
 
     async def refresh_if_needed(self) -> dict[str, object]:
         """Refresh discovery candidates when thresholds are met.

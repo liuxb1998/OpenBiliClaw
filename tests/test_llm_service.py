@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+from types import SimpleNamespace
 from typing import TYPE_CHECKING
 
 import pytest
@@ -14,6 +15,7 @@ from openbiliclaw.llm.base import (
     LLMFallbackError,
     LLMProviderError,
     LLMRateLimitError,
+    LLMRegistry,
     LLMResponse,
     LLMResponseError,
     LLMTimeoutError,
@@ -23,6 +25,7 @@ from openbiliclaw.llm.base import (
     is_llm_moderation_error,
     is_reasoning_budget_exhausted,
 )
+from openbiliclaw.llm.openai_provider import OpenAIProvider
 from openbiliclaw.llm.service import (
     MIN_STRUCTURED_MAX_TOKENS,
     LLMProviderExecutionError,
@@ -1102,6 +1105,45 @@ def test_is_reasoning_budget_exhausted_ignores_other_failures() -> None:
     assert not is_reasoning_budget_exhausted(
         RuntimeError("returned reasoning but no final content")
     )
+
+
+@pytest.mark.asyncio
+async def test_reasoning_budget_exhausted_from_responses_flavor_survives_service_wrapping(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Integration: a responses-flavor instance that burns the whole output
+    budget on thinking raises an error the evaluation batch-halving self-heal
+    recognizes even after registry fallback + service-layer wrapping."""
+    provider = OpenAIProvider(api_key="test-key", api_flavor="responses")
+    registry = LLMRegistry()
+    registry.register(provider)
+    service = LLMService(registry=registry, memory=object())  # type: ignore[arg-type]
+    calls = {"count": 0}
+
+    async def fake_create(**_: object) -> SimpleNamespace:
+        calls["count"] += 1
+        return SimpleNamespace(
+            model="gpt-5-mini",
+            status="incomplete",
+            incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+            output=[SimpleNamespace(type="reasoning", summary=[])],
+            usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15),
+        )
+
+    monkeypatch.setattr(provider._client.responses, "create", fake_create)
+
+    with pytest.raises(LLMProviderExecutionError) as exc_info:
+        await service.complete_with_core_memory(
+            system_instruction="sys",
+            user_input="hi",
+            caller="discovery.eval",
+            max_tokens=512,
+            inject_core_memory=False,
+        )
+
+    assert is_reasoning_budget_exhausted(exc_info.value)
+    # The doubled-budget retry fired before the error propagated.
+    assert calls["count"] == 2
 
 
 @pytest.mark.asyncio

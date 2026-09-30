@@ -5801,3 +5801,60 @@ async def test_bili_search_does_not_claim_when_eval_supply_is_full(tmp_path: Pat
 
     assert all("keywords" not in kwargs for kwargs in pipeline.produce_kwargs)
     assert _bili_kw_statuses(kw_db) == {"kw1": "pending"}
+
+
+class _IdleExpressionCopyCoordinator:
+    """The API process's never-started coordinator: perpetual idle payload."""
+
+    def status_payload(self) -> dict[str, object]:
+        return {
+            "expression_pending_count": 0,
+            "expression_batch_state": "idle",
+            "expression_last_completed": 0,
+        }
+
+
+def test_delegated_coordinator_status_overlays_local_idle_payload() -> None:
+    controller = ContinuousRefreshController(
+        memory_manager=_FakeMemoryManager(),
+        database=_FakeDatabase([], pool_count=0),
+        soul_engine=_FakeSoulEngine(),
+        discovery_engine=_FakeDiscoveryEngine(),
+        recommendation_engine=_FakeRecommendationEngine(),
+        expression_copy_coordinator=_IdleExpressionCopyCoordinator(),
+        delegated_coordinator_status_reader=lambda: {
+            "expression_copy": {
+                "expression_pending_count": 19,
+                "expression_batch_state": "backoff",
+                "expression_last_completed": 0,
+            },
+            "candidate_eval": {
+                "candidate_eval_state": "backoff",
+                "candidate_eval_pending": 10,
+            },
+        },
+    )
+
+    status = controller.get_runtime_status()
+
+    assert status["expression_pending_count"] == 19
+    assert status["expression_batch_state"] == "backoff"
+    assert status["candidate_eval_state"] == "backoff"
+    assert status["candidate_eval_pending"] == 10
+
+
+def test_missing_delegated_status_keeps_local_coordinator_payload() -> None:
+    controller = ContinuousRefreshController(
+        memory_manager=_FakeMemoryManager(),
+        database=_FakeDatabase([], pool_count=0),
+        soul_engine=_FakeSoulEngine(),
+        discovery_engine=_FakeDiscoveryEngine(),
+        recommendation_engine=_FakeRecommendationEngine(),
+        expression_copy_coordinator=_IdleExpressionCopyCoordinator(),
+        delegated_coordinator_status_reader=lambda: None,
+    )
+
+    status = controller.get_runtime_status()
+
+    assert status["expression_pending_count"] == 0
+    assert status["expression_batch_state"] == "idle"

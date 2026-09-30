@@ -1841,6 +1841,27 @@ class RuntimeContext:
             ),
         )
         new_runtime_controller.candidate_eval_coordinator = new_candidate_eval_coordinator
+        # Delegated deployment (``openbiliclaw start``): the coordinators live
+        # in the discovery-worker process while this process's instances never
+        # start and would report a perpetual idle. Aggregate the worker's live
+        # payloads through the existing worker-status file channel; a missing
+        # or stale heartbeat keeps the local (single-process) values.
+        from openbiliclaw.runtime.worker_status import WorkerStatusStore
+
+        _discovery_status_store = WorkerStatusStore(
+            new_config.data_path / "runtime" / "discovery_worker_status.json"
+        )
+
+        def _read_delegated_coordinator_status() -> dict[str, Any] | None:
+            data = _discovery_status_store.read_if_fresh()
+            if data is None:
+                return None
+            coordinators = data.get("coordinators")
+            return coordinators if isinstance(coordinators, dict) else None
+
+        new_runtime_controller.delegated_coordinator_status_reader = (
+            _read_delegated_coordinator_status
+        )
         new_candidate_pipeline.on_candidates_enqueued = lambda _count: (
             new_candidate_eval_coordinator.notify("candidate_enqueued:pipeline")
         )

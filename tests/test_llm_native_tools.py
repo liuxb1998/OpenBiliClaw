@@ -14,6 +14,7 @@ from openbiliclaw.llm.base import (
     LLMResponse,
     LLMResponseError,
     LLMToolCallUnsupportedError,
+    is_reasoning_budget_exhausted,
 )
 from openbiliclaw.llm.ollama_provider import OllamaProvider
 from openbiliclaw.llm.openai_provider import DeepSeekProvider, OpenAIProvider
@@ -59,6 +60,23 @@ def _tool_call_message(
             )
         ],
         usage=SimpleNamespace(prompt_tokens=10, completion_tokens=5, total_tokens=15),
+    )
+
+
+def _length_exhausted_message() -> SimpleNamespace:
+    """Reasoning-first model burned the whole output budget on thinking."""
+    return SimpleNamespace(
+        model="deepseek-v4-flash",
+        choices=[
+            SimpleNamespace(
+                finish_reason="length",
+                message=SimpleNamespace(
+                    content="",
+                    reasoning_content="reasoning exhausted the output budget",
+                ),
+            )
+        ],
+        usage=SimpleNamespace(prompt_tokens=10, completion_tokens=512, total_tokens=522),
     )
 
 
@@ -184,6 +202,77 @@ class TestOpenAINativeToolCalling:
             "thinking": {"type": "enabled"},
             "reasoning_effort": "max",
         }
+
+    async def test_length_exhausted_retries_with_larger_budget_and_keeps_tools(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """A reasoning model that burned the whole budget on thinking (empty
+        content, no tool_calls, finish_reason=length) gets one doubled-budget
+        retry with the tools payload intact."""
+        provider = OpenAIProvider(api_key="test-key", provider_name="openai_compatible")
+        calls: list[dict[str, Any]] = []
+
+        async def fake_request(**kwargs: object) -> SimpleNamespace:
+            calls.append(dict(kwargs))
+            if len(calls) == 1:
+                return _length_exhausted_message()
+            return _tool_call_message([{"id": "call_1", "name": "list_sources", "arguments": "{}"}])
+
+        monkeypatch.setattr(provider, "_request_with_retry", fake_request)
+
+        response = await provider.complete_with_tools(MESSAGES, TOOLS, max_tokens=4096)
+
+        assert response.tool_calls == [
+            {"id": "call_1", "name": "list_sources", "arguments": {}, "arguments_raw": "{}"}
+        ]
+        assert len(calls) == 2
+        assert calls[0]["max_tokens"] == 4096
+        assert calls[1]["max_tokens"] == 8192
+        assert calls[1]["tools"] == TOOLS
+        assert calls[1]["tool_choice"] == "auto"
+
+    async def test_length_exhausted_retry_exhausted_raises_reasoning_error(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """When the doubled budget still comes back length-truncated and empty,
+        the original reasoning-budget error (and agent-loop failure
+        semantics) is unchanged."""
+        provider = OpenAIProvider(api_key="test-key", provider_name="openai_compatible")
+        calls: list[dict[str, Any]] = []
+
+        async def fake_request(**kwargs: object) -> SimpleNamespace:
+            calls.append(dict(kwargs))
+            return _length_exhausted_message()
+
+        monkeypatch.setattr(provider, "_request_with_retry", fake_request)
+
+        with pytest.raises(LLMResponseError) as exc_info:
+            await provider.complete_with_tools(MESSAGES, TOOLS, max_tokens=4096)
+
+        message = str(exc_info.value)
+        assert "returned reasoning but no final content" in message
+        assert "finish_reason=length" in message
+        assert is_reasoning_budget_exhausted(exc_info.value)
+        assert len(calls) == 2
+        assert calls[-1]["max_tokens"] == 8192
+
+    async def test_tool_calls_response_skips_length_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """The normal tool-calling path never enters the budget retry."""
+        provider = OpenAIProvider(api_key="test-key")
+        calls = {"count": 0}
+
+        async def fake_request(**_: object) -> SimpleNamespace:
+            calls["count"] += 1
+            return _tool_call_message([{"id": "call_1", "name": "list_sources", "arguments": "{}"}])
+
+        monkeypatch.setattr(provider, "_request_with_retry", fake_request)
+
+        response = await provider.complete_with_tools(MESSAGES, TOOLS)
+
+        assert response.tool_calls is not None
+        assert calls["count"] == 1
 
 
 class _FakeProvider(LLMProvider):
@@ -432,3 +521,45 @@ class TestServiceNativeTools:
         assert response.tool_calls is None
         system_message = provider.plain_requests[0][0]
         assert "<available_tools>" not in str(system_message["content"])
+
+    async def test_responses_flavor_simulation_recovers_via_budget_retry(
+        self, monkeypatch: pytest.MonkeyPatch
+    ) -> None:
+        """Responses-flavor instances have no native FC, so the service runs
+        prompt-simulated tool calling through ``complete()``; a reasoning
+        model that truncates the simulated reply (incomplete /
+        max_output_tokens) now recovers through the doubled-budget retry."""
+        provider = OpenAIProvider(api_key="test-key", api_flavor="responses")
+        registry = LLMRegistry()
+        registry.register(provider)
+        service = self._service(registry)
+        calls: list[dict[str, Any]] = []
+
+        async def fake_create(**kwargs: object) -> SimpleNamespace:
+            calls.append(dict(kwargs))
+            if len(calls) == 1:
+                return SimpleNamespace(
+                    model="gpt-5-mini",
+                    status="incomplete",
+                    incomplete_details=SimpleNamespace(reason="max_output_tokens"),
+                    output=[],
+                    usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15),
+                )
+            return SimpleNamespace(
+                model="gpt-5-mini",
+                status="completed",
+                output_text='{"tool_call": {"name": "list_sources", "arguments": {}}}',
+                output=[],
+                usage=SimpleNamespace(input_tokens=10, output_tokens=5, total_tokens=15),
+            )
+
+        monkeypatch.setattr(provider._client.responses, "create", fake_create)
+
+        response = await service.complete_with_native_tools(
+            messages=MESSAGES, tools=TOOLS, caller="agent.loop"
+        )
+
+        assert response.tool_calls is not None
+        assert response.tool_calls[0]["name"] == "list_sources"
+        assert len(calls) == 2
+        assert calls[1]["max_output_tokens"] == 2 * calls[0]["max_output_tokens"]

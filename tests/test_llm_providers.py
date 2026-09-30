@@ -21,6 +21,7 @@ from openbiliclaw.llm.base import (
     LLMRateLimitError,
     LLMResponseError,
     LLMTimeoutError,
+    is_reasoning_budget_exhausted,
 )
 from openbiliclaw.llm.claude_provider import ClaudeProvider
 from openbiliclaw.llm.gemini_provider import GeminiProvider, gemini_sdk_available
@@ -2069,15 +2070,21 @@ def _responses_response(
     *,
     with_output_text: bool = True,
     truncated: bool = False,
+    with_reasoning: bool = False,
 ) -> SimpleNamespace:
+    output: list[SimpleNamespace] = []
+    if with_reasoning:
+        # Reasoning models emit a reasoning-phase item before the message.
+        output.append(SimpleNamespace(type="reasoning", summary=[]))
+    output.append(
+        SimpleNamespace(
+            type="message",
+            content=[SimpleNamespace(type="output_text", text=text)],
+        )
+    )
     response = SimpleNamespace(
         model="gpt-5-mini",
-        output=[
-            SimpleNamespace(
-                type="message",
-                content=[SimpleNamespace(type="output_text", text=text)],
-            )
-        ],
+        output=output,
         usage=SimpleNamespace(
             input_tokens=10,
             output_tokens=5,
@@ -2352,6 +2359,83 @@ async def test_openai_provider_responses_flavor_skips_length_retry_when_budget_a
 
     assert "returned empty content" in str(exc_info.value)
     assert len(calls) == 1
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_responses_flavor_reports_reasoning_budget_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reasoning-phase output + truncation + no final message raises the same
+    marker pair as the chat path, so ``is_reasoning_budget_exhausted()`` (and
+    the evaluation batch-halving self-heal) recognizes it. The doubled-budget
+    retry fires BEFORE the error is raised."""
+    provider = OpenAIProvider(api_key="test-key", api_flavor="responses")
+    calls: list[dict[str, object]] = []
+
+    async def fake_create(**kwargs: object) -> SimpleNamespace:
+        calls.append(dict(kwargs))
+        return _responses_response("", truncated=True, with_reasoning=True)
+
+    monkeypatch.setattr(provider._client.responses, "create", fake_create)
+
+    with pytest.raises(LLMResponseError) as exc_info:
+        await provider.complete(
+            [{"role": "user", "content": "hi"}],
+            max_tokens=512,
+        )
+
+    message = str(exc_info.value)
+    assert "returned reasoning but no final content" in message
+    assert "finish_reason=length" in message
+    assert is_reasoning_budget_exhausted(exc_info.value)
+    assert len(calls) == 2
+    assert calls[-1]["max_output_tokens"] == 1024
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_responses_flavor_plain_empty_error_without_reasoning(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Truncated and empty but without any reasoning-phase output stays the
+    plain empty-content error and is not mistaken for reasoning-budget
+    exhaustion."""
+    provider = OpenAIProvider(api_key="test-key", api_flavor="responses")
+
+    async def fake_create(**_: object) -> SimpleNamespace:
+        return _responses_response("", truncated=True)
+
+    monkeypatch.setattr(provider._client.responses, "create", fake_create)
+
+    with pytest.raises(LLMResponseError) as exc_info:
+        await provider.complete([{"role": "user", "content": "hi"}])
+
+    assert "returned empty content" in str(exc_info.value)
+    assert not is_reasoning_budget_exhausted(exc_info.value)
+
+
+@pytest.mark.asyncio
+async def test_openai_provider_responses_flavor_reasoning_without_truncation_not_exhausted(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Reasoning-phase output with a non-truncated terminal status mirrors the
+    chat path's finish_reason!=length case: the message names the reasoning
+    phase but does NOT carry the length marker the classifier requires."""
+    provider = OpenAIProvider(api_key="test-key", api_flavor="responses")
+
+    async def fake_create(**_: object) -> SimpleNamespace:
+        response = _responses_response("", with_reasoning=True)
+        response.status = "completed"
+        return response
+
+    monkeypatch.setattr(provider._client.responses, "create", fake_create)
+
+    with pytest.raises(LLMResponseError) as exc_info:
+        await provider.complete([{"role": "user", "content": "hi"}])
+
+    message = str(exc_info.value)
+    assert "returned reasoning but no final content" in message
+    assert "finish_reason=completed" in message
+    assert not is_reasoning_budget_exhausted(exc_info.value)
 
 
 @pytest.mark.asyncio

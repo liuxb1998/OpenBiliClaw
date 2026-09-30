@@ -167,6 +167,7 @@ class CandidateEvalCoordinator:
         if self._paused and resume_notification:
             self._paused = False
             self._backoff_until = 0.0
+            logger.info("candidate evaluation resumed on %s", reason)
         if resume_notification:
             self._revive_failed_eval_candidates(reason)
         self._wake_event.set()
@@ -393,6 +394,12 @@ class CandidateEvalCoordinator:
             self.last_batch_seconds = float(getattr(outcome, "elapsed_seconds", 0.0) or 0.0)
             self.last_cached = int(result.get("cached", 0))
             self.last_rejected = int(result.get("rejected", 0))
+            if self._rate_limit_streak > 0 or self._transient_streak > 0:
+                logger.info(
+                    "candidate evaluation recovered after backoff: cached=%d rejected=%d",
+                    self.last_cached,
+                    self.last_rejected,
+                )
             self._rate_limit_streak = 0
             self._transient_streak = 0
             if int(result.get("evaluated", 0)) > 0 and self.last_cached <= 0:
@@ -432,10 +439,23 @@ class CandidateEvalCoordinator:
                 min(self._rate_limit_streak, len(_RATE_LIMIT_BACKOFF_SECONDS) - 1)
             ]
             self._rate_limit_streak += 1
-            self._backoff_until = now + max(delay, self._retry_after_seconds(exc))
+            backoff = max(delay, self._retry_after_seconds(exc))
+            self._backoff_until = now + backoff
+            logger.warning(
+                "candidate evaluation rate limited; backing off %.0fs (streak=%d): %s",
+                backoff,
+                self._rate_limit_streak,
+                self.last_error,
+            )
             return
         if kind in {"no_provider", "auth_failed"}:
             self._paused = True
+            logger.warning(
+                "candidate evaluation paused on %s; waiting for a startup/config_*/manual_* "
+                "wake: %s",
+                kind,
+                self.last_error,
+            )
             return
         if kind not in {"timeout", "connection", "server_error"}:
             logger.warning("candidate evaluation worker failed: %s", exc)
