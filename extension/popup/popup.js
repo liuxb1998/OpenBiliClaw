@@ -5827,6 +5827,7 @@ let dialogueContextSelection = readContextSelection(
   "extension-popup",
 );
 let retainedChatDraft = "";
+const popupChatDrafts = new Map();
 
 function popupContextStorage() {
   try { return globalThis.localStorage; } catch { return null; }
@@ -6275,6 +6276,11 @@ function renderChatSessionsPanel() {
 
 async function switchPopupChatSession(sessionId) {
   if (!sessionId) return;
+  if (sessionId !== popupChatSessionId) {
+    popupChatDrafts.set(popupChatSessionId, elements.chatInput?.value ?? retainedChatDraft);
+    retainedChatDraft = popupChatDrafts.get(sessionId) || "";
+    if (elements.chatInput) elements.chatInput.value = retainedChatDraft;
+  }
   elements.chatPersonaDialog?.close();
   popupPersonaError = "";
   popupChatSessionId = sessionId;

@@ -96,6 +96,7 @@
       "desktop-web",
     );
     let retainedChatDraft = "";
+    const chatSessionDrafts = new Map();
     const dialogueCardActionAbortController = new AbortController();
     const CHAT_SCROLL_BOTTOM_TOLERANCE_PX = 48;
     let hasOpenedDialogueChatPage = false;
@@ -7890,6 +7891,12 @@ ${cardFeedbackBarHtml()}`;
 
     async function selectChatSession(sessionId) {
       const id = String(sessionId || "default");
+      if (id !== state.agentChat.sessionId) {
+        const input = $("#chatInput");
+        chatSessionDrafts.set(state.agentChat.sessionId || "default", input?.value ?? retainedChatDraft);
+        retainedChatDraft = chatSessionDrafts.get(id) || "";
+        if (input) input.value = retainedChatDraft;
+      }
       state.agentChat.sessionId = id;
       toggleChatPersonaPicker(false);
       const storage = agentChatStorage();

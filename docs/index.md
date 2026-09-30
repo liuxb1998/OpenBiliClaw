@@ -35,6 +35,7 @@
 - [知乎来源文档](modules/zhihu.md) — 浏览器任务、布尔登录态、全局 `知乎收藏` 开关与新文档零点击确认边界
 - [网页工具与聊天笔记验收](testing/2026-09-26-chat-web-memory.md) — 搜索、公开链接阅读、笔记更正/审批删除与三端真实请求
 - [聊天真实请求复验（9月28日）](testing/2026-09-28-chat-real-request-recheck.md) — 19 次真实模型请求、三端 UI、延迟样本与仍存在的限制
+- [聊天完整复查（9月30日）](testing/2026-09-30-chat-comprehensive-e2e.md) — 最新 main 合并验收、三端草稿修复、审批冲突/任务恢复、真实限流与功能流程优化优先级
 - [聊天风格模板验收](testing/2026-09-26-chat-personas.md) — 六种会话风格、三端真实请求与跨设备保存、移动布局和验证边界
 - [手动端到端联调](manual-e2e.md) — CLI、插件与 SQLite 的真实联调步骤
 - [Agent 机器契约 (短)](agent-install.md) — 给 AI 智能体读取的短部署契约,配合 README 的短粘贴语句

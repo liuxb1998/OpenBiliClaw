@@ -183,6 +183,7 @@ let activeSessionId = (() => {
   }
 })();
 let chatSessions = [];
+const sessionDrafts = new Map();
 let sessionsDrawerOpen = false;
 let sessionRenameId = "";
 let sessionSkillMap = (() => {
@@ -950,6 +951,10 @@ async function switchSession(sessionId) {
     renderAgentOverlays();
     return;
   }
+  const input = $root?.querySelector("#chat-input");
+  sessionDrafts.set(activeSessionId, input?.value ?? retainedDraft);
+  retainedDraft = sessionDrafts.get(sessionId) || "";
+  if (input) input.value = retainedDraft;
   activeSessionId = sessionId;
   historyRefreshGeneration += 1;
   historyRefreshInFlight = false;

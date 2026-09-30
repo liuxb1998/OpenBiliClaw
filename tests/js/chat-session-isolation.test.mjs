@@ -19,6 +19,44 @@ function deferred() {
   return { promise, resolve };
 }
 
+for (const surface of ["desktop", "mobile", "popup"]) {
+  test(`${surface} unsent drafts belong to one session and clearing is retained`, async () => {
+    const input = { value: "draft A", focus() {} };
+    const store = new Map();
+    const context = vm.createContext({
+      state: { agentChat: { sessionId: "a" } },
+      activeSessionId: "a", popupChatSessionId: "a",
+      chatSessionDrafts: store, sessionDrafts: store, popupChatDrafts: store,
+      retainedChatDraft: "", retainedDraft: "",
+      $: () => input, $root: { querySelector: () => input },
+      elements: { chatInput: input, chatSendButton: {}, chatMessages: { replaceChildren() {} } },
+      localStorage: { setItem() {} }, window: { innerWidth: 1440 },
+      AGENT_CHAT_SKILL_KEY: "skills", POPUP_CHAT_SESSION_STORAGE_KEY: "session", CHAT_SESSION_STORAGE_KEY: "session",
+      agentChatStorage: () => null, toggleChatPersonaPicker() {}, persistAgentChatPrefs() {},
+      lastDialogueChatSignature: null, chatSessionsSignature: "", applyAgentChatChrome() {}, renderChat() {},
+      refreshDialogueTurns: async () => {}, renderPopupPersonaPicker() {},
+      chatHistoryHydrationGeneration: 0, chatHistoryHydrationInFlight: false,
+      lastChatHistorySignature: null, dialogueTurnsById: new Map(), setChatSubtab() {},
+      hydrateChatHistory: async () => {}, renderChatSkillSelect() {},
+      historyRefreshGeneration: 0, historyRefreshInFlight: false, lastHistorySignature: null,
+      streamingTurnIds: new Set(), agentRunsByTurnId: new Map(), renderAgentOverlays() {}, render() {},
+      loadHistory: async () => {},
+    });
+    const name = surface === "desktop" ? "selectChatSession" : surface === "mobile" ? "switchSession" : "switchPopupChatSession";
+    vm.runInContext(fn({ desktop, mobile, popup }[surface], name, surface === "desktop" ? "    " : ""), context);
+    await context[name]("b");
+    assert.equal(input.value, "", "new conversation must not inherit another draft");
+    input.value = "draft B";
+    await context[name]("a");
+    assert.equal(input.value, "draft A", "returning restores the owning draft");
+    input.value = ""; // User cleared it, or submit consumed it.
+    await context[name]("b");
+    assert.equal(input.value, "draft B");
+    await context[name]("a");
+    assert.equal(input.value, "", "cleared/sent text must not resurrect");
+  });
+}
+
 test("desktop history from a departed session cannot overwrite the selected session", async () => {
   const response = deferred();
   const applied = [];

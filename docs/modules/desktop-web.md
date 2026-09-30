@@ -22,6 +22,7 @@ LLM 实例设置页可选择 `api_route`（API Route），新实例预填 `gpt-5
 | M8 任务中心 | ✅ | 侧栏入口 + 右侧抽屉：任务列表（状态/进度/取消）、详情复用过程流组件渲染 `steps`、完成后 report + 建议清单（逐项确认：soft_write「确认执行」/ hard_write「去对话确认」，v1 统一落成来源会话里的结构化指令消息）；`start_background_task` 确认卡；`agent_task_summary` turn 渲染系统汇总卡 |
 | M8 回退与兼容 | ✅ | 探测 `GET /api/chat/skills` 失败 → legacy 模式（布局与行为与 M8 前完全一致）；agent 流 503（`loop_enabled=false`）时当轮回退旧 `/api/chat/stream` 假流式；delight/探针内嵌聊天、假设卡片、待聊确认、对话上下文引用等旧功能不动 |
 | 会话与流结束隔离 | ✅ | SSE 必须收到 `done` 才确认完成，提前 EOF 走历史恢复；历史快照按来源会话与请求代次校验；live 回复只在来源会话展示，旧回合 `done.skill` 不覆盖用户中途切换的角色 |
+| 未发送草稿按会话隔离 | ✅ | 切换前保存当前输入，切回恢复对应草稿；新会话为空，发送或清空后不复活旧文字。草稿仅保存在本页面内存，不跨刷新或设备同步 |
 | 聊天风格选择 | ✅ | 顶部独立风格入口，六种单选模板、说明和同题预览；保存到当前会话，刷新/跨端同步，从新消息生效。保存期间阻止本会话抢先发送；晚到请求不覆盖新会话或已保存选择 |
 | 审批拒绝草稿 | ✅ | 与移动 Web / popup 共用 `agent-chat.js` 的拒绝编辑保留助手，轮询和过程重绘保留原因输入与焦点；终态更新不会复活旧操作按钮 |
 
@@ -30,6 +31,9 @@ LLM 实例设置页可选择 `api_route`（API Route），新实例预填 `gpt-5
 不影响已有角色和聊天；目录独立加载，不阻塞会话历史。切入 agent 模式即清除 legacy
 共享历史，迟到的 bootstrap/legacy 快照不再覆盖当前会话。保存回执不确定时提示刷新或重试，
 不宣称服务器未写入。
+
+草稿隔离不新增 HTTP 接口：`selectChatSession()` 在更换会话 ID 前保存输入框的实时值，
+随后同步恢复目标会话草稿，再请求历史。历史恢复和旧会话流完成不会把草稿带到其他会话。
 
 ## 模块结构
 
@@ -98,6 +102,11 @@ start_background_task）、会话/任务/审批/skill 列表 markup、异步审�
 `applyApprovalRecordToProcess` 中间态恢复与终态不降级）。
 
 运行：`node --test tests/js/*.test.mjs`
+
+`tests/js/chat-session-isolation.test.mjs` 同时验证桌面、移动和 popup 的真实切换函数：
+新会话不继承输入、切回恢复各自草稿、清空/发送后的文字不复活。
+[9 月 30 日完整复查](../testing/2026-09-30-chat-comprehensive-e2e.md)包含真实浏览器、
+真实模型请求、后台任务失败与恢复，以及仍待优化的耗时问题。
 
 ### 网页工具和聊天笔记
 
