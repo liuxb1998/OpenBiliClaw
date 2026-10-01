@@ -18,6 +18,12 @@ from xml.etree import ElementTree
 
 import httpx
 
+from openbiliclaw.bilibili.search_backoff import (
+    persist_shared_backoff,
+    read_shared_backoff,
+    snapshot_from_monotonic,
+)
+
 logger = logging.getLogger(__name__)
 
 
@@ -344,13 +350,59 @@ class BilibiliAPIClient:
         self._last_request_at = time.monotonic()
 
     @classmethod
+    def _merge_shared_backoff(cls) -> None:
+        """Adopt any stricter backoff another process persisted to disk.
+
+        The CLI runs API server + worker + discovery worker as separate
+        processes, each with its own copy of the ClassVars below; the shared
+        state file lets a 412 hard cooldown (or a v_voucher soft cooldown) in
+        one process back off all of them. On-disk deadlines are wall-clock
+        epochs (``time.monotonic()`` is not comparable across processes) and
+        merge with ``max`` so the most conservative process wins; the
+        escalation counters only merge while they still belong to a live
+        incident. Any I/O failure leaves the in-process state untouched.
+        """
+        shared = read_shared_backoff()
+        if shared is None:
+            return
+        now_wall = time.time()
+        now_monotonic = time.monotonic()
+        cooldown_remaining = shared.cooldown_until - now_wall
+        if cooldown_remaining > cls._search_cooldown_until - now_monotonic:
+            cls._search_cooldown_until = now_monotonic + cooldown_remaining
+        fallback_remaining = shared.dom_fallback_until - now_wall
+        if fallback_remaining > cls._search_dom_fallback_until - now_monotonic:
+            cls._search_dom_fallback_until = now_monotonic + fallback_remaining
+        if shared.counters_fresh(now_wall):
+            cls._search_cooldown_level = max(cls._search_cooldown_level, shared.cooldown_level)
+            cls._search_voucher_block_streak = max(
+                cls._search_voucher_block_streak,
+                shared.voucher_block_streak,
+            )
+
+    @classmethod
+    def _persist_search_backoff(cls, *, reset_counters: bool = False) -> None:
+        """Mirror the in-process backoff state to the shared state file."""
+        persist_shared_backoff(
+            snapshot_from_monotonic(
+                cooldown_until=cls._search_cooldown_until,
+                cooldown_level=cls._search_cooldown_level,
+                voucher_block_streak=cls._search_voucher_block_streak,
+                dom_fallback_until=cls._search_dom_fallback_until,
+            ),
+            reset_counters=reset_counters,
+        )
+
+    @classmethod
     def search_cooldown_remaining(cls) -> float:
-        """Seconds remaining in the process-wide Bilibili search cooldown."""
+        """Seconds remaining in the shared Bilibili search cooldown."""
+        cls._merge_shared_backoff()
         return max(0.0, cls._search_cooldown_until - time.monotonic())
 
     @classmethod
     def search_dom_fallback_remaining(cls) -> float:
         """Seconds remaining while rendered-page search fallback is preferred."""
+        cls._merge_shared_backoff()
         return max(0.0, cls._search_dom_fallback_until - time.monotonic())
 
     @classmethod
@@ -361,11 +413,13 @@ class BilibiliAPIClient:
         search may keep probing, but the browser extension can backfill via a
         rendered search page while the API path looks degraded.
         """
+        cls._merge_shared_backoff()
         duration = cls._SEARCH_DOM_FALLBACK_SECONDS if seconds is None else seconds
         cls._search_dom_fallback_until = max(
             cls._search_dom_fallback_until,
             time.monotonic() + duration,
         )
+        cls._persist_search_backoff()
         return duration
 
     @classmethod
@@ -376,6 +430,7 @@ class BilibiliAPIClient:
         longer hard-cooldown base); the escalation multiplier and absolute
         ceiling are shared across both causes.
         """
+        cls._merge_shared_backoff()
         cls._search_cooldown_level = min(cls._search_cooldown_level + 1, 3)
         base = cls._SEARCH_COOLDOWN_BASE_SECONDS if base_seconds is None else base_seconds
         duration = min(
@@ -386,6 +441,8 @@ class BilibiliAPIClient:
             cls._search_cooldown_until,
             time.monotonic() + duration,
         )
+        # Persists the whole snapshot (cooldown deadline included) via the
+        # dom-fallback activation below.
         cls._activate_search_dom_fallback(seconds=duration)
         return duration
 
@@ -400,7 +457,9 @@ class BilibiliAPIClient:
         not an IP-level block, and must not strand the search round +
         explore for the full cooldown.
         """
+        cls._merge_shared_backoff()
         cls._search_voucher_block_streak += 1
+        cls._persist_search_backoff()
         if cls._search_voucher_block_streak >= cls._SEARCH_VOUCHER_BLOCK_THRESHOLD:
             return cls._activate_search_cooldown()
         return 0.0
@@ -410,6 +469,7 @@ class BilibiliAPIClient:
         """Reset escalation + the v_voucher streak once search succeeds again."""
         cls._search_cooldown_level = 0
         cls._search_voucher_block_streak = 0
+        cls._persist_search_backoff(reset_counters=True)
 
     @staticmethod
     def _sanitized_http_error(
