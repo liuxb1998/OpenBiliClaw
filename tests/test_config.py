@@ -1152,6 +1152,38 @@ def test_validate_runtime_config_requires_api_route_api_key() -> None:
         validate_runtime_config(config)
 
 
+def test_build_config_supports_cheaperinference_provider() -> None:
+    config = _build_config(
+        {
+            "llm": {
+                "default_provider": "cheaperinference",
+                "cheaperinference": {
+                    "api_key": "ci_live_test",
+                    "model": "claude-sonnet-5",
+                    "base_url": "https://api.cheaperinference.com/v1",
+                },
+            }
+        }
+    )
+
+    assert config.llm.default_provider == "cheaperinference"
+    assert config.llm.cheaperinference.api_key == "ci_live_test"
+    assert config.llm.cheaperinference.model == "claude-sonnet-5"
+    assert config.llm.cheaperinference.base_url == "https://api.cheaperinference.com/v1"
+
+
+def test_validate_runtime_config_requires_cheaperinference_api_key() -> None:
+    config = Config(
+        llm=LLMConfig(
+            default_provider="cheaperinference",
+            cheaperinference=LLMProviderConfig(model="gpt-5.4-mini"),
+        )
+    )
+
+    with pytest.raises(ConfigError, match="llm.cheaperinference.api_key"):
+        validate_runtime_config(config)
+
+
 def test_validate_runtime_config_requires_requesty_api_key() -> None:
     config = Config(
         llm=LLMConfig(

@@ -858,6 +858,7 @@ class LLMService:
             "orcarouter",
             "requesty",
             "api_route",
+            "cheaperinference",
         }:
             return False
 

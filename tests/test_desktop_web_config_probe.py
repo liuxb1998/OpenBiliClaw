@@ -132,3 +132,28 @@ def test_api_route_provider_exposed_across_web_surfaces() -> None:
         assert 'api_route: { model: "gpt-5.5", base_url: "https://global.api-route.com/v1" }' in js
     assert 'api_route: ["https://global.api-route.com/", "API Route"]' in setup_html
     assert 'api_route: "gpt-5.5"' in setup_html
+
+
+def test_cheaperinference_provider_exposed_across_web_surfaces() -> None:
+    desktop_html = (ROOT / "src/openbiliclaw/web/desktop/index.html").read_text(encoding="utf-8")
+    desktop_js = (ROOT / "src/openbiliclaw/web/desktop/assets/js/app.js").read_text(
+        encoding="utf-8"
+    )
+    setup_html = (ROOT / "src/openbiliclaw/web/setup/index.html").read_text(encoding="utf-8")
+    popup_html = (ROOT / "extension/popup/popup.html").read_text(encoding="utf-8")
+    popup_js = (ROOT / "extension/popup/popup.js").read_text(encoding="utf-8")
+
+    for html in (desktop_html, setup_html, popup_html):
+        assert '<option value="cheaperinference">Cheaper Inference</option>' in html
+    for js in (desktop_js, popup_js):
+        assert 'cheaperinference: "Cheaper Inference"' in js
+        assert (
+            'cheaperinference: { model: "gpt-5.4-mini", '
+            'base_url: "https://api.cheaperinference.com/v1" }'
+        ) in js
+    assert 'cheaperinference: ["https://cheaperinference.com/signup", "Cheaper Inference"]' in (
+        setup_html
+    )
+    assert 'cheaperinference: "gpt-5.4-mini"' in setup_html
+    assert 'id="cfgCheaperinferenceKey"' in popup_html
+    assert 'setVal("cfgCheaperinferenceKey", cfg.llm?.cheaperinference?.api_key)' in popup_js

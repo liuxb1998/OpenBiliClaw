@@ -215,6 +215,11 @@
 - **`LLMService.complete_with_native_tools()`**：agent loop 单跳入口，接收完整 canonical 消息列表 + OpenAI 工具 schema；路由首选 provider 支持原生 FC 走 native 链，否则把消息展平（assistant.tool_calls → 文本注释、role=tool → `[工具执行结果]`）进 prompt 模拟，解析 `{"tool_call": ...}` / `{"tool_calls": [...]}` 多调用 JSON；两条路径都不注入 core memory（loop 调用方拥有 system prompt）。旧 `complete_with_tools()`（单跳、旧扁平 schema）保持不变。
 - **多跳 `AgentLoop`（`agent/loop.py`）**：`run()` 异步生成器逐跳产出 `AgentEvent`（thinking / tool_call / tool_result / final / step_limit_reached，`to_dict()` 供 M2 SSE 序列化）；默认 64 跳上限（新增 `[agent]` 配置段 `loop_max_steps` / `tool_result_max_chars`，见 `docs/modules/config.md`），超限后发出 step_limit_reached 并以无工具收尾调用让模型汇报进展；未知工具名与参数校验失败以 `ok=false` 结果回填模型自纠；工具结果超长截断并标记。回归：`tests/test_agent_tool_registry.py` / `tests/test_llm_native_tools.py` / `tests/test_agent_loop.py` + `test_config.py` 的 `[agent]` round-trip。
 
+## 新增 Cheaper Inference 内置 Provider（2026-09-30，cheaperinference-provider）
+
+- `provider_type="cheaperinference"` 通过 OpenAI 兼容接口接入 Cheaper Inference，默认 `https://api.cheaperinference.com/v1`、`gpt-5.4-mini`，模型名不带厂商前缀。支持独立实例、调用链、模型发现（只列 `type` 为 `text` 的聊天模型）和请求探测；多模型网关不发送 `reasoning_effort`，embedding 仍需独立配置。
+- 接入后端配置与 API、CLI 和安装向导（菜单第 10 项）、桌面与扩展设置、首次设置向导；补充配置样例、文档和回归测试。只有用户显式配置时才会调用。
+
 ## v0.3.224：自定义回复语气与设置页一键测试（2026-09-19）
 
 - **Responses 初始化 JSON 请求修复（issue #265）**：启用 JSON mode 时，OpenAI / OpenAI-compatible Responses 适配器确保 `input` 消息包含 JSON 输出指令，修复 system 被拆到 `instructions` 后部分端点拒绝偏好分析的 HTTP 400。已有 JSON 输入不重复追加，普通文本调用与调用方消息不变。

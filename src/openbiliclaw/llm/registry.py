@@ -12,6 +12,7 @@ from openbiliclaw import network
 
 from .api_route_provider import ApiRouteProvider
 from .base import LLMProvider, LLMProviderError, LLMRegistry
+from .cheaperinference_provider import CheaperInferenceProvider
 from .claude_provider import ClaudeProvider
 from .dashscope_provider import DashScopeEmbeddingProvider
 from .gemini_provider import GeminiProvider, gemini_sdk_available
@@ -70,6 +71,7 @@ def build_llm_registry(
         ("openai_compatible", _maybe_openai_compatible_provider(config, overrides)),
         ("requesty", _maybe_requesty_provider(config, overrides)),
         ("api_route", _maybe_api_route_provider(config, overrides)),
+        ("cheaperinference", _maybe_cheaperinference_provider(config, overrides)),
     ]
 
     for _name, provider in provider_specs:
@@ -227,6 +229,7 @@ def _build_instance_provider(
         "orcarouter": _maybe_orcarouter_provider,
         "requesty": _maybe_requesty_provider,
         "api_route": _maybe_api_route_provider,
+        "cheaperinference": _maybe_cheaperinference_provider,
         "openai_compatible": _maybe_openai_compatible_provider,
     }
     factory = factories.get(provider_type)
@@ -1003,6 +1006,26 @@ def _maybe_api_route_provider(
     return ApiRouteProvider(
         api_key=cfg.api_key,
         model=cfg.model or "gpt-5.5",
+        base_url=base_url,
+        timeout=float(config.llm.timeout),
+        proxy=_outbound_proxy(base_url),
+        trust_env=_outbound_trust_env(base_url),
+        reasoning_effort=cfg.reasoning_effort,
+    )
+
+
+def _maybe_cheaperinference_provider(
+    config: Config, overrides: dict[str, LLMProvider]
+) -> LLMProvider | None:
+    if "cheaperinference" in overrides:
+        return overrides["cheaperinference"]
+    cfg = config.llm.cheaperinference
+    if not cfg.api_key.strip():
+        return None
+    base_url = cfg.base_url or "https://api.cheaperinference.com/v1"
+    return CheaperInferenceProvider(
+        api_key=cfg.api_key,
+        model=cfg.model or "gpt-5.4-mini",
         base_url=base_url,
         timeout=float(config.llm.timeout),
         proxy=_outbound_proxy(base_url),

@@ -93,6 +93,7 @@ SUPPORTED_PROVIDERS = (
     "openai_compatible",
     "requesty",
     "api_route",
+    "cheaperinference",
 )
 REMOTE_PROVIDERS = (
     "openai",
@@ -104,6 +105,7 @@ REMOTE_PROVIDERS = (
     "openai_compatible",
     "requesty",
     "api_route",
+    "cheaperinference",
 )
 
 # Providers whose backend has no embeddings endpoint. When a user picks
@@ -119,6 +121,7 @@ PROVIDERS_WITHOUT_EMBED = (
     "orcarouter",
     "requesty",
     "api_route",
+    "cheaperinference",
 )
 
 
@@ -205,6 +208,7 @@ HUMAN_LLM_MENU: tuple[tuple[str, str, str], ...] = (
     ("orcarouter", "OrcaRouter 聚合", "openai/gpt-4o"),
     ("requesty", "Requesty 聚合", "openai/gpt-4o-mini"),
     ("api_route", "API Route 聚合", "gpt-5.5"),
+    ("cheaperinference", "Cheaper Inference 聚合", "gpt-5.4-mini"),
 )
 
 HUMAN_OPENAI_COMPAT_PRESETS: tuple[str, ...] = (
@@ -229,6 +233,7 @@ PROVIDER_MODEL_DEFAULTS: dict[str, str] = {
     "orcarouter": "openai/gpt-4o",
     "requesty": "openai/gpt-4o-mini",
     "api_route": "gpt-5.5",
+    "cheaperinference": "gpt-5.4-mini",
     "ollama": "qwen2.5:7b",
 }
 
@@ -239,6 +244,7 @@ PROVIDER_BASE_URL_DEFAULTS: dict[str, str] = {
     "orcarouter": "https://api.orcarouter.ai/v1",
     "requesty": "https://router.requesty.ai/v1",
     "api_route": "https://global.api-route.com/v1",
+    "cheaperinference": "https://api.cheaperinference.com/v1",
 }
 
 
@@ -2112,6 +2118,7 @@ def _ensure_llm_instance(project_dir: Path, provider: str) -> str:
         "openai_compatible": "OpenAI-compatible",
         "requesty": "Requesty",
         "api_route": "API Route",
+        "cheaperinference": "Cheaper Inference",
     }
     update_config_secret(
         config_path,
@@ -3225,6 +3232,7 @@ remote = {
     "openai_compatible",
     "requesty",
     "api_route",
+    "cheaperinference",
 }
 instances = llm.get("instances", {}) if isinstance(llm.get("instances"), dict) else {}
 chain = llm.get("default_chain", []) if isinstance(llm.get("default_chain"), list) else []

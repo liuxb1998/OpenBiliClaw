@@ -6720,6 +6720,7 @@
             <option value="orcarouter">OrcaRouter</option>
             <option value="requesty">Requesty</option>
             <option value="api_route">API Route</option>
+            <option value="cheaperinference">Cheaper Inference</option>
             <option value="openai_compatible">OpenAI 协议兼容 (Groq/Together/Azure/vLLM)</option>
           </select>
         </div>
@@ -6744,6 +6745,7 @@
             <option value="orcarouter">OrcaRouter</option>
             <option value="requesty">Requesty</option>
             <option value="api_route">API Route</option>
+            <option value="cheaperinference">Cheaper Inference</option>
             <option value="openai_compatible">OpenAI 协议兼容 (Groq/Together/Azure/vLLM)</option>
           </select>
         </div>
@@ -6904,6 +6906,21 @@
             <input id="cfgApiRouteBaseUrl" type="text" placeholder="https://global.api-route.com/v1">
           </div>
         </div>
+        <!-- Cheaper Inference -->
+        <div class="settings-provider-fields" data-provider="cheaperinference">
+          <div class="settings-field">
+            <label for="cfgCheaperinferenceKey">Cheaper Inference API Key</label>
+            <input id="cfgCheaperinferenceKey" type="password" autocomplete="off" placeholder="ci_live_...">
+          </div>
+          <div class="settings-field">
+            <label for="cfgCheaperinferenceModel">Model</label>
+            <input id="cfgCheaperinferenceModel" type="text" placeholder="gpt-5.4-mini">
+          </div>
+          <div class="settings-field">
+            <label for="cfgCheaperinferenceBaseUrl">Base URL</label>
+            <input id="cfgCheaperinferenceBaseUrl" type="text" placeholder="https://api.cheaperinference.com/v1">
+          </div>
+        </div>
         <!-- OpenAI Compatible -->
         <div class="settings-provider-fields" data-provider="openai_compatible">
           <p class="settings-hint">
@@ -6993,6 +7010,7 @@
             <option value="orcarouter">OrcaRouter</option>
             <option value="requesty">Requesty</option>
             <option value="api_route">API Route</option>
+            <option value="cheaperinference">Cheaper Inference</option>
             <option value="openai_compatible">OpenAI 协议兼容</option>
           </select>
         </div>
@@ -7013,6 +7031,7 @@
             <option value="orcarouter">OrcaRouter</option>
             <option value="requesty">Requesty</option>
             <option value="api_route">API Route</option>
+            <option value="cheaperinference">Cheaper Inference</option>
             <option value="openai_compatible">OpenAI 协议兼容</option>
           </select>
         </div>
@@ -7033,6 +7052,7 @@
             <option value="orcarouter">OrcaRouter</option>
             <option value="requesty">Requesty</option>
             <option value="api_route">API Route</option>
+            <option value="cheaperinference">Cheaper Inference</option>
             <option value="openai_compatible">OpenAI 协议兼容</option>
           </select>
         </div>
@@ -7053,6 +7073,7 @@
             <option value="orcarouter">OrcaRouter</option>
             <option value="requesty">Requesty</option>
             <option value="api_route">API Route</option>
+            <option value="cheaperinference">Cheaper Inference</option>
             <option value="openai_compatible">OpenAI 协议兼容</option>
           </select>
         </div>
@@ -8285,6 +8306,7 @@
                 <option value="orcarouter">OrcaRouter</option>
                 <option value="requesty">Requesty</option>
                 <option value="api_route">API Route</option>
+                <option value="cheaperinference">Cheaper Inference</option>
                 <option value="ollama">Ollama</option>
                 <option value="openai_compatible">OpenAI-compatible</option>
               </select>

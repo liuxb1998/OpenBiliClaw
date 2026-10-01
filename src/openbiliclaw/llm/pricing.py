@@ -48,6 +48,7 @@ CACHE_HIT_DISCOUNT: dict[str, float] = {
     "orcarouter": 0.50,
     "requesty": 0.50,
     "api_route": 0.50,
+    "cheaperinference": 0.50,
     "ollama": 0.0,  # local; cached or not, cost is 0
 }
 
@@ -146,6 +147,11 @@ PRICING: dict[str, dict[str, tuple[float, float]]] = {
         # $0.30/$1.80 per M tokens; convert with the same ~7.2 USD/CNY
         # assumption used above. Other routes use a midrange estimate.
         "gpt-5.5": (0.00216, 0.01296),
+        "default": (0.005, 0.015),
+    },
+    "cheaperinference": {
+        # Gateway pricing follows the upstream model. Without knowing the
+        # model, use the same midrange estimate as OpenRouter.
         "default": (0.005, 0.015),
     },
     "ollama": {

@@ -164,6 +164,7 @@ _CACHE_USAGE_SEMANTICS_BY_PROVIDER = {
     "orcarouter": "prompt_includes_cached",
     "requesty": "prompt_includes_cached",
     "api_route": "prompt_includes_cached",
+    "cheaperinference": "prompt_includes_cached",
 }
 
 
@@ -1914,6 +1915,7 @@ class _ProviderAttemptUsageRecorder:
                 "orcarouter",
                 "requesty",
                 "api_route",
+                "cheaperinference",
                 "deepseek",
             }:
                 continue
@@ -2485,6 +2487,7 @@ def validate_json_minify_transport(
             "orcarouter",
             "requesty",
             "api_route",
+            "cheaperinference",
             "deepseek",
         }:
             if call.get("provider_attempt_accounting") != "raw_adapter_attempts":
@@ -2949,6 +2952,7 @@ def validate_candidate_transport_experiment(
             "orcarouter",
             "requesty",
             "api_route",
+            "cheaperinference",
             "deepseek",
         }:
             if call.get("provider_attempt_accounting") != "raw_adapter_attempts":
