@@ -4,6 +4,12 @@
 
 ## v0.3.225：聊一聊链接分享、多行输入与逐字流式（2026-10-01）
 
+### 优化：B 站 /view 载荷进程内缓存——同一轮不再重复拉同一视频（2026-10-02，feat/bili-view-data-cache，issue #232）
+
+- **问题**：一轮 discovery 里同一个 bvid 会被多个环节各自请求 `/x/web-interface/view`——推荐打分（`get_video_info`）、danmaku / 字幕 / play 的 cid 解析、收藏 / 稍后再看的 aid 解析、API 层 view 转发，同一出口 IP 承受数倍于必要的请求量。
+- **方案**：`get_video_view_data()` 对成功响应做进程级 LRU 缓存（ClassVar `OrderedDict`，TTL 600s、上限 512 条）；缓存键携带 SESSDATA 指纹（匿名与登录响应可能不同，explore 策略使用匿名 client），失败永不缓存。回归：`tests/test_bilibili_view_cache.py` +6 条（同 bvid 只请求一次、不同 bvid 分别请求、匿名 / 登录隔离、过期重取、失败不缓存、LRU 逐出）；`tests/conftest.py` 增加 autouse fixture 每测试清空缓存，防止跨测试泄漏。
+- **文档同步**：`docs/modules/bilibili.md`（特性表新增「/view 进程内缓存」行）。
+
 ### 修复：B 站搜索冷却状态跨进程共享（2026-10-01，feat/bili-search-cooldown-shared-state，issue #232）
 
 - **问题**：搜索冷却 / 退避档位 / v_voucher streak / DOM fallback 四项状态此前只是 `BilibiliAPIClient` 的 ClassVar，仅同进程共享；CLI 四进程布局（API 主进程 + worker + discovery worker）下，API 进程被 412 打进 600s 硬冷却后 discovery worker 仍用 API 搜索打同一出口 IP，worker 侧触发的 DOM fallback 信号 API 进程也看不到。

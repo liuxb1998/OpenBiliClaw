@@ -11,6 +11,7 @@ import hashlib
 import logging
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal, cast
 from urllib.parse import quote, urlencode, urlparse
@@ -235,6 +236,14 @@ class BilibiliAPIClient:
     _search_cooldown_level: ClassVar[int] = 0
     _search_voucher_block_streak: ClassVar[int] = 0
     _search_dom_fallback_until: ClassVar[float] = 0.0
+    # Process-wide LRU for /view payloads: one discovery round resolves the
+    # same bvid through get_video_info() (scoring), _resolve_aid() (save
+    # writes), cid lookup (danmaku/subtitle/play) and the API layer, each of
+    # which used to re-issue the request. The key carries a SESSDATA
+    # fingerprint because anonymous and authenticated responses can differ.
+    _VIEW_DATA_CACHE_TTL_SECONDS: ClassVar[float] = 600.0
+    _VIEW_DATA_CACHE_MAX_ENTRIES: ClassVar[int] = 512
+    _view_data_cache: ClassVar[OrderedDict[str, tuple[float, dict[str, Any]]]] = OrderedDict()
     _WBI_MIXIN_KEY_ENC_TAB = [
         46,
         47,
@@ -643,6 +652,31 @@ class BilibiliAPIClient:
             mid=int(data.get("mid", 0)),
         )
 
+    def _view_cache_key(self, bvid: str) -> str:
+        """Cache key scoped by login identity: anon and authed /view payloads differ."""
+        sessdata = _cookie_value(self._cookie, "SESSDATA")
+        identity = hashlib.sha256(sessdata.encode()).hexdigest()[:12] if sessdata else "anon"
+        return f"{identity}:{bvid}"
+
+    @classmethod
+    def _view_cache_get(cls, key: str) -> dict[str, Any] | None:
+        entry = cls._view_data_cache.get(key)
+        if entry is None:
+            return None
+        fetched_at, payload = entry
+        if time.monotonic() - fetched_at > cls._VIEW_DATA_CACHE_TTL_SECONDS:
+            cls._view_data_cache.pop(key, None)
+            return None
+        cls._view_data_cache.move_to_end(key)
+        return payload
+
+    @classmethod
+    def _view_cache_put(cls, key: str, payload: dict[str, Any]) -> None:
+        cls._view_data_cache[key] = (time.monotonic(), payload)
+        cls._view_data_cache.move_to_end(key)
+        while len(cls._view_data_cache) > cls._VIEW_DATA_CACHE_MAX_ENTRIES:
+            cls._view_data_cache.popitem(last=False)
+
     async def get_video_view_data(self, bvid: str) -> dict[str, Any]:
         """Fetch the /view data object, falling back to the WBI-signed endpoint.
 
@@ -650,9 +684,19 @@ class BilibiliAPIClient:
         for a given network/IP (HTTP 412). The WBI-signed sibling
         ``/x/web-interface/wbi/view`` is still accepted by the web API and is
         the standard web client path for this payload.
+
+        Successful payloads are cached process-wide for
+        ``_VIEW_DATA_CACHE_TTL_SECONDS`` (keyed by bvid + login identity) so a
+        discovery round that touches the same video through scoring, danmaku,
+        play info and save writes only issues one request; failures are never
+        cached.
         """
+        key = self._view_cache_key(bvid)
+        cached = self._view_cache_get(key)
+        if cached is not None:
+            return cached
         try:
-            return await self._get_json("/x/web-interface/view", params={"bvid": bvid})
+            data = await self._get_json("/x/web-interface/view", params={"bvid": bvid})
         except BilibiliAPIError as exc:
             if exc.code != -412:
                 raise
@@ -662,10 +706,12 @@ class BilibiliAPIClient:
             )
             img_key, sub_key = await self._get_wbi_keys()
             signed = self._sign_wbi_params({"bvid": bvid}, img_key=img_key, sub_key=sub_key)
-            return await self._get_json(
+            data = await self._get_json(
                 "/x/web-interface/wbi/view",
                 params=signed,
             )
+        self._view_cache_put(key, data)
+        return data
 
     async def get_video_info(self, bvid: str) -> VideoInfo:
         """Get video information by BV ID.

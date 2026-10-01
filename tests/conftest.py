@@ -2,11 +2,13 @@
 
 from __future__ import annotations
 
+from collections import OrderedDict
 from typing import TYPE_CHECKING
 
 import pytest
 
 from openbiliclaw.bilibili import search_backoff
+from openbiliclaw.bilibili.api import BilibiliAPIClient
 
 if TYPE_CHECKING:
     from pathlib import Path
@@ -28,3 +30,13 @@ def _isolate_bilibili_search_backoff(
         "_state_path_override",
         tmp_path / "bilibili_search_backoff.json",
     )
+
+
+@pytest.fixture(autouse=True)
+def _isolate_bilibili_view_cache(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Give every test an empty /view payload cache.
+
+    The cache is a process-wide ClassVar keyed by bvid; without isolation a
+    payload cached by one test's fake transport would leak into the next.
+    """
+    monkeypatch.setattr(BilibiliAPIClient, "_view_data_cache", OrderedDict())
