@@ -50,10 +50,26 @@ class SharedBackoff:
     voucher_block_streak: int = 0
     dom_fallback_until: float = 0.0
     updated_at: float = 0.0
+    # Wall-clock time of the last cooldown activation and of the last
+    # recovery probe; both anchor the half-window probe rhythm.
+    activated_at: float = 0.0
+    last_probe_at: float = 0.0
 
     def counters_fresh(self, now: float) -> bool:
         """Whether the persisted counters still belong to a live incident."""
         return 0.0 <= now - self.updated_at <= _COUNTER_TTL_SECONDS
+
+    def probe_due_at(self) -> float:
+        """Wall time when a recovery probe becomes allowed (0 = never).
+
+        The probe fires halfway through the active cooldown window so a
+        lifted block is discovered in ~half the worst-case 1800s instead of
+        idling the whole cooldown out.
+        """
+        window = self.cooldown_until - self.activated_at
+        if window <= 0.0:
+            return 0.0
+        return self.activated_at + window / 2
 
 
 def configure_search_backoff_state_path(path: Path | None) -> None:
@@ -103,6 +119,8 @@ def _normalize(raw: Any) -> SharedBackoff:
         voucher_block_streak=max(0, int(_as_float(raw.get("voucher_block_streak")))),
         dom_fallback_until=max(0.0, _as_float(raw.get("dom_fallback_until"))),
         updated_at=max(0.0, _as_float(raw.get("updated_at"))),
+        activated_at=max(0.0, _as_float(raw.get("activated_at"))),
+        last_probe_at=max(0.0, _as_float(raw.get("last_probe_at"))),
     )
 
 
@@ -117,6 +135,8 @@ def _serialize(state: SharedBackoff) -> dict[str, object]:
         "voucher_block_streak": state.voucher_block_streak,
         "dom_fallback_until": state.dom_fallback_until,
         "updated_at": state.updated_at,
+        "activated_at": state.activated_at,
+        "last_probe_at": state.last_probe_at,
     }
 
 
@@ -140,16 +160,21 @@ def persist_shared_backoff(
     snapshot: SharedBackoff,
     *,
     reset_counters: bool = False,
+    clear: bool = False,
 ) -> None:
     """Merge ``snapshot`` into the persisted state (read-modify-write).
 
     Deadlines merge with ``max`` so the most conservative process wins. The
     escalation level and v_voucher streak also merge with ``max`` — except
     when ``reset_counters`` is set (a search succeeded), in which case the
-    snapshot's zeroed counters overwrite so the recovery propagates.
+    snapshot's zeroed counters overwrite so the recovery propagates. When
+    ``clear`` is set (a recovery probe proved the API healthy again), the
+    snapshot overwrites the whole record, deadlines included.
     """
 
     def mutate(shared: SharedBackoff) -> SharedBackoff:
+        if clear:
+            return snapshot
         if reset_counters:
             level = snapshot.cooldown_level
             streak = snapshot.voucher_block_streak
@@ -166,6 +191,8 @@ def persist_shared_backoff(
             voucher_block_streak=streak,
             dom_fallback_until=max(shared.dom_fallback_until, snapshot.dom_fallback_until),
             updated_at=snapshot.updated_at,
+            activated_at=max(shared.activated_at, snapshot.activated_at),
+            last_probe_at=max(shared.last_probe_at, snapshot.last_probe_at),
         )
 
     path = _state_path()
@@ -185,6 +212,29 @@ def persist_shared_backoff(
         )
 
 
+def mark_search_recovery_probe(now: float) -> None:
+    """Record that the current cooldown window's recovery probe was spent."""
+
+    def mutate(shared: SharedBackoff) -> SharedBackoff:
+        return replace(shared, last_probe_at=max(shared.last_probe_at, now), updated_at=now)
+
+    path = _state_path()
+    if path is None:
+        return
+    try:
+        update_json_state(
+            path,
+            default_factory=SharedBackoff,
+            normalize=_normalize,
+            serialize=_serialize,
+            mutate=mutate,
+        )
+    except Exception:
+        logger.debug(
+            "bilibili search backoff: probe mark failed — in-process state only", exc_info=True
+        )
+
+
 def _monotonic_to_wall(deadline: float, *, now_wall: float, now_monotonic: float) -> float:
     if deadline <= 0.0:
         return 0.0  # unset stays unset instead of becoming "expires right now"
@@ -197,6 +247,8 @@ def snapshot_from_monotonic(
     cooldown_level: int,
     voucher_block_streak: int,
     dom_fallback_until: float,
+    activated_at: float = 0.0,
+    last_probe_at: float = 0.0,
 ) -> SharedBackoff:
     """Convert the client's monotonic-clock ClassVars into a persistable snapshot."""
     now_wall = time.time()
@@ -211,4 +263,6 @@ def snapshot_from_monotonic(
             dom_fallback_until, now_wall=now_wall, now_monotonic=now_monotonic
         ),
         updated_at=now_wall,
+        activated_at=activated_at,
+        last_probe_at=last_probe_at,
     )
