@@ -4,6 +4,12 @@
 
 ## v0.3.225：聊一聊链接分享、多行输入与逐字流式（2026-10-01）
 
+### 修复：B 站搜索冷却状态跨进程共享（2026-10-01，feat/bili-search-cooldown-shared-state，issue #232）
+
+- **问题**：搜索冷却 / 退避档位 / v_voucher streak / DOM fallback 四项状态此前只是 `BilibiliAPIClient` 的 ClassVar，仅同进程共享；CLI 四进程布局（API 主进程 + worker + discovery worker）下，API 进程被 412 打进 600s 硬冷却后 discovery worker 仍用 API 搜索打同一出口 IP，worker 侧触发的 DOM fallback 信号 API 进程也看不到。
+- **方案**：新增 `bilibili/search_backoff.py`，把四项状态镜像到 `<data_dir>/bilibili_search_backoff.json`——deadline 以墙钟存储（`time.monotonic()` 跨进程不可比），复用 `memory/json_state.py` 的文件锁读-改-写，读取时按「最保守者赢」合并（deadline 取 max；escalation 档位与 streak 只在最长冷却 1800s 的事故窗口内合并，避免陈旧 streak 误触发新进程），任一进程搜索成功后清零计数并传播。状态文件不可写 / 不存在时完全退回进程内行为（fail-open，无新增配置项）；schema 预留 `scope` 字段，为后续按 cookie / proxy 分账留口。回归：`tests/test_bilibili_search_backoff.py` +9 条（412 硬冷却 / DOM fallback / streak 跨进程可见、最保守 deadline 获胜、reset 传播、陈旧计数忽略、禁用与不可写时逐字退回进程内行为、落盘 schema）；新增 `tests/conftest.py` 把套件的状态文件统一重定向到 tmp，避免测试读写真实 `data/`。
+- **文档同步**：`docs/modules/bilibili.md`（搜索风控冷却特性行 + 设计要点第 10 条）。
+
 ### 特性：聊天回复 token 级流式输出（2026-10-01，feat/token-streaming，issue #83）
 
 - **LLM 层流式契约**：`LLMProvider` 新增 `stream_complete()` / `stream_complete_with_tools()` 异步生成器，产出 `LLMStreamChunk`（`delta` 增量块 + 携带聚合 `LLMResponse` 的终止块）；基类默认实现调用 `complete()` / `complete_with_tools()` 后一次性吐全文，Claude / Gemini / CodexChatGPT 等所有现存 provider 零改动兼容。真流式在 `OpenAIProvider`（chat-completions flavor）落地：`stream=True` + `stream_options.include_usage`（老网关拒绝 `stream_options` 时降级一次重试），FC 流式把 `tool_calls` 增量静默聚合到终止块、只把 content 增量实时吐出；responses flavor 与 `json_mode` 保持一次性回退（结构化调用依赖格式拒绝重试梯），DeepSeek / Ollama / OpenRouter / OrcaRouter / Requesty / ApiRoute / openai_compatible 子类自动继承真流式。流式路径刻意不做「截断翻倍预算重发」——中途重发会重复已展示文本。
