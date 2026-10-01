@@ -31,6 +31,7 @@
 | 原生收藏 / 稍后再看写入 | ✅ | `BilibiliAPIClient` 新增认证 form POST、exact-title 收藏夹复用/创建、视频收藏和稍后再看写入；`BilibiliNativeSaveAdapter` 将 B 站 application code 归一化为 saved-sync 状态，并已由 `RuntimeContext` 注册到平台中立 `/api/saved/*`。UI 仍属后续任务；默认关闭自动同步，旧 B 站保存端点仍只写本地。 |
 | 分区 id 与视频标签 | ✅ | `get_video_info()` 从同一 `/x/web-interface/view` 响应补填 `tid` / `tid_v2`（零额外请求）；新增 `get_video_tags(bvid)` 走 `/x/tag/archive/tags` 取标签名（匿名可用，响应远轻于 `/x/web-interface/view/detail`）。**实测（2026-09-11，8 个分区各 1 个样本）**：`/view` 响应**不含 `tag` 数组**，`tname` / `tname_v2` **恒为空字符串** —— 因此该路径下 `VideoInfo.tags` 保持 `None`，标签名只能由 `get_video_tags()` 显式获取。 |
 | 3.3 agent-browser 集成 | ✅ | navigate / get_page_content + CLI browser 命令 |
+| /view 进程内缓存 | ✅ | `get_video_view_data()` 对成功响应做进程级 LRU 缓存（TTL 600s、上限 512 条，键含 SESSDATA 指纹以区分匿名 / 登录响应）：同一轮 discovery 里推荐打分、danmaku / 字幕 / play 的 cid 解析、收藏写入的 aid 解析复用同一次请求，失败永不缓存 |
 
 ### Danmaku outcome API
 
