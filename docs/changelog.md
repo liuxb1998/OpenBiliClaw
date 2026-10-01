@@ -10,6 +10,12 @@
 - **方案**：冷却窗口过半时，`search()` 放行**一次**单 attempt 恢复探测——状态文件新增 `activated_at` / `last_probe_at` 字段（向后兼容，缺省 0），探测预算跨进程共享、每个冷却窗口最多一次；探测成功即清除全部冷却与 DOM fallback 状态（`clear` 模式整体覆写落盘）并传播到所有进程，探测失败则经既有 412 / v_voucher 路径自然重新武装（escalate）冷却；持久化禁用 / 不可读时退回进程内「每窗口一次」的内存语义。请求成本有界：每窗口至多一次额外搜索请求。回归：`tests/test_bilibili_search_backoff.py` +6 条（未过半不探测、过半探测且仅一次、探测预算跨进程共享、禁用持久化时内存兜底、无冷却不探测、探测成功清除冷却并落盘）。真实请求 E2E：半程窗口下探测发出恰好 nav + 1 次搜索请求、返回 5 条真实结果、冷却即刻清零落盘；未过半窗口保持零请求跳过。
 - **文档同步**：`docs/modules/bilibili.md`（搜索风控冷却特性行 + 设计要点第 10 条）。
 
+### 优化：B 站 /view 载荷进程内缓存——同一轮不再重复拉同一视频（2026-10-02，feat/bili-view-data-cache，issue #232）
+
+- **问题**：一轮 discovery 里同一个 bvid 会被多个环节各自请求 `/x/web-interface/view`——推荐打分（`get_video_info`）、danmaku / 字幕 / play 的 cid 解析、收藏 / 稍后再看的 aid 解析、API 层 view 转发，同一出口 IP 承受数倍于必要的请求量。
+- **方案**：`get_video_view_data()` 对成功响应做进程级 LRU 缓存（ClassVar `OrderedDict`，TTL 600s、上限 512 条）；缓存键携带 SESSDATA 指纹（匿名与登录响应可能不同，explore 策略使用匿名 client），失败永不缓存。回归：`tests/test_bilibili_view_cache.py` +6 条（同 bvid 只请求一次、不同 bvid 分别请求、匿名 / 登录隔离、过期重取、失败不缓存、LRU 逐出）；`tests/conftest.py` 增加 autouse fixture 每测试清空缓存，防止跨测试泄漏。
+- **文档同步**：`docs/modules/bilibili.md`（特性表新增「/view 进程内缓存」行）。
+
 ### 修复：B 站搜索冷却状态跨进程共享（2026-10-01，feat/bili-search-cooldown-shared-state，issue #232）
 
 - **问题**：搜索冷却 / 退避档位 / v_voucher streak / DOM fallback 四项状态此前只是 `BilibiliAPIClient` 的 ClassVar，仅同进程共享；CLI 四进程布局（API 主进程 + worker + discovery worker）下，API 进程被 412 打进 600s 硬冷却后 discovery worker 仍用 API 搜索打同一出口 IP，worker 侧触发的 DOM fallback 信号 API 进程也看不到。
