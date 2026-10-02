@@ -2,7 +2,7 @@
 
 ## 版本与环境
 
-在 `fix/chat-live-recheck-1002` 独立 worktree 中，将当前 `main@6b910eac` 整合到此前聊天修复链 `914c7dbc`。main 本身尚不包含这条聊天分支，因此本报告验收的是整合版本，不代表正式主分支已经应用修复。没有修改正式配置、停止正式服务或合入 main。
+测试在 `fix/chat-live-recheck-1002` 独立 worktree 中进行，以 `main@6b910eac` 和此前聊天修复链 `914c7dbc` 的整合版本为基线，受测修复最终提交为 `4b7b3123`。测试阶段没有修改正式配置、停止正式服务或合入 main；下文记录的是该整合版本的实测结果。
 
 - 真实产品后端：本机 18460；legacy 对照后端 18461，`agent.loop_enabled=false`。
 - 真实外部模型：沿用当前配置的 `deepseek-v4-flash` / `sensenova-6.8-flash-lite` 路由，使用原生 HTTP 与 SSE。这轮没有使用 CLI 转接或模型 mock；统计里的模型名以返回/记录为准。
@@ -53,7 +53,17 @@
 - Web JavaScript：116 passed。合并后测试 fixture 补齐新的 agentDeltaBuffers，业务断言未弱化。
 - 插件全套：1527 passed；TypeScript typecheck、build:bundle 通过。全量 Python 分片覆盖收集时的 9914 项：原始 9843 passed、65 skipped、6 failed；6 项均为配置路径断言与隔离环境变量冲突，在独立临时 cwd 清除该变量后全部通过，合计 9849 passed、65 skipped，无未解决失败。不是原始单次全绿。最后追加的两项准入错误回归另包含在 63 项针对集中。
 - 最终修改后 Ruff 全量、MyPy 304 个源文件、git diff --check 均通过。
-- 界面截图检查：移动 360px、插件 430px 无横向溢出，桌面/移动/插件截图保存在 output/playwright/live-1002-*-final.png；插件卡片修复截图为 live-1002-popup-open-card-fixed.png。
+- 界面截图检查：移动 360px、插件 430px 无横向溢出，桌面/移动/插件截图为 live-1002-*-final.png；插件卡片修复截图为 live-1002-popup-open-card-fixed.png，收尾归档位置见下文。
 - 测试浏览器与两个临时服务已关闭；正式 18420/18421 服务保持运行。
 
-全量明细位于 `/tmp/chat-live-1002-pytest-isolated/result-summary.json`，真实请求与浏览器记录位于 `/tmp/chat-live-1002-*.log`。临时后端配置及备份中复制的模型凭据已删除；模型原配置未改动。
+临时后端配置及备份中复制的模型凭据已删除；模型原配置未改动。
+
+## 收尾交付
+
+交付以已验证的 `4b7b3123` 为代码基准，收尾提交仅补充文档，不修改受测业务代码。各轮文字报告随代码保留；截图及全量测试结果明细已归档到主工作区本地忽略目录 `output/qa/chat-closeout-20261002/`，`manifest.json` 记录文件校验值。
+
+- 本轮截图：`OpenBiliClaw-chat-live-recheck-1002/output/playwright/` 子目录。
+- 全量明细：`result-summary.json`，保留原始失败和隔离重跑的记录。
+- 配置、Cookie、测试数据库和浏览器登录资料不纳入归档。
+
+合入与推送属于代码交付，不代表正式服务已经重启加载新代码；正式服务未在本轮测试及收尾中重启。
