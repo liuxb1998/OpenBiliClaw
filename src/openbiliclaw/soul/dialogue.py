@@ -32,6 +32,7 @@ if TYPE_CHECKING:
     from openbiliclaw.soul.dialogue_learn_queue import DialogueSettlementQueue
     from openbiliclaw.soul.dialogue_turn_context import DialogueTurnBinding
     from openbiliclaw.soul.engine import SoulEngine
+    from openbiliclaw.sources.link_ingest import LinkIngestor, LinkIngestResult
 
 logger = logging.getLogger(__name__)
 
@@ -145,6 +146,7 @@ class SocraticDialogue:
         *,
         learning_mode: DialogueLearningMode | str,
         settlement_queue: DialogueSettlementQueue | None = None,
+        link_ingestor: LinkIngestor | None = None,
     ) -> None:
         self._llm = llm
         self._soul_engine = soul_engine
@@ -169,6 +171,9 @@ class SocraticDialogue:
         self._module_overrides = dict(module_overrides) if module_overrides is not None else None
         self._learning_mode = DialogueLearningMode(learning_mode)
         self._settlement_queue = settlement_queue
+        # Chat link ingestion (issue #83): None disables it entirely, keeping
+        # prompt bytes identical to the pre-ingest baseline.
+        self._link_ingestor = link_ingestor
 
     @property
     def learning_mode(self) -> DialogueLearningMode:
@@ -227,9 +232,8 @@ class SocraticDialogue:
             self._ensure_history_loaded()
             history_length = len(self._history)
             turn_timestamp = self._local_now().isoformat()
-            self._history.append(
-                DialogueTurn(role="user", content=user_message, timestamp=turn_timestamp)
-            )
+            user_turn = DialogueTurn(role="user", content=user_message, timestamp=turn_timestamp)
+            self._history.append(user_turn)
 
             try:
                 service = self._llm_service or self._build_service()
@@ -238,6 +242,12 @@ class SocraticDialogue:
                     if binding is not None
                     else user_message
                 )
+                link_result = await self._ingest_message_links(user_message)
+                if link_result is not None:
+                    if link_result.prompt_block:
+                        prompt_message = f"{prompt_message}\n\n{link_result.prompt_block}"
+                    if link_result.relation_hint:
+                        user_turn.relation_prefix = link_result.relation_hint
                 prompt_user_message = self._user_prompt_with_current_time(prompt_message)
 
                 # If tools are configured, try tool-calling path first
@@ -275,6 +285,118 @@ class SocraticDialogue:
                 payload["dialogue_binding"] = binding.to_mapping()
             self._queue_dialogue_learning(payload, binding=binding)
             return reply
+
+    async def respond_stream(
+        self,
+        user_message: str,
+        *,
+        scope: str = "chat",
+        turn_id: str = "",
+        session: str = "",
+        dialogue_binding: DialogueTurnBinding | Mapping[str, object] | None = None,
+        progress: Any = None,
+    ) -> AsyncIterator[str]:
+        """Streaming variant of :meth:`respond`, yielding reply text deltas.
+
+        Same history, learning and locking semantics as ``respond``: the
+        user turn is appended up front (rolled back on failure) and the
+        completed reply is recorded once the stream finishes. Tool-enabled
+        turns keep the one-shot tool flow and yield the final reply as a
+        single delta; plain turns stream token deltas live from the service.
+        """
+        if self._learning_mode is DialogueLearningMode.QUEUED and self._settlement_queue is None:
+            raise DialogueLearningConfigurationError(
+                "queued dialogue learning requires DialogueSettlementQueue"
+            )
+
+        binding: DialogueTurnBinding | None = None
+        if dialogue_binding is not None:
+            from openbiliclaw.soul.dialogue_turn_context import DialogueTurnBinding
+
+            if isinstance(dialogue_binding, DialogueTurnBinding):
+                binding = dialogue_binding
+            elif isinstance(dialogue_binding, Mapping):
+                binding = DialogueTurnBinding.from_mapping(dialogue_binding)
+            else:
+                raise TypeError("dialogue_binding must be DialogueTurnBinding or a mapping")
+
+        async with self._respond_lock:
+            self._ensure_history_loaded()
+            history_length = len(self._history)
+            turn_timestamp = self._local_now().isoformat()
+            user_turn = DialogueTurn(role="user", content=user_message, timestamp=turn_timestamp)
+            self._history.append(user_turn)
+
+            try:
+                service = self._llm_service or self._build_service()
+                prompt_message = (
+                    binding.render_user_prompt(user_message)
+                    if binding is not None
+                    else user_message
+                )
+                link_result = await self._ingest_message_links(user_message)
+                if link_result is not None:
+                    if link_result.prompt_block:
+                        prompt_message = f"{prompt_message}\n\n{link_result.prompt_block}"
+                    if link_result.relation_hint:
+                        user_turn.relation_prefix = link_result.relation_hint
+                prompt_user_message = self._user_prompt_with_current_time(prompt_message)
+
+                # If tools are configured, keep the one-shot tool-calling
+                # path: whether the reply is a tool_call payload is known
+                # only after the full text, so it cannot stream live.
+                if self._tools and self._tool_dispatcher:
+                    reply = await self._respond_with_tools(
+                        service, prompt_user_message, progress=progress
+                    )
+                    yield reply
+                else:
+                    reply_parts: list[str] = []
+                    response_content = ""
+                    stream_fn = getattr(service, "stream_socratic_dialogue", None)
+                    if callable(stream_fn):
+                        async for chunk in stream_fn(
+                            user_message=prompt_user_message,
+                            history=self._history_to_messages(),
+                            caller="soul.dialogue",
+                        ):
+                            if chunk.delta:
+                                reply_parts.append(chunk.delta)
+                                yield chunk.delta
+                            if chunk.response is not None:
+                                response_content = chunk.response.content
+                        reply = response_content or "".join(reply_parts)
+                    else:
+                        # Duck-typed doubles predating token streaming.
+                        response = await service.complete_socratic_dialogue(
+                            user_message=prompt_user_message,
+                            history=self._history_to_messages(),
+                            caller="soul.dialogue",
+                        )
+                        reply = response.content
+                        yield reply
+            except BaseException:
+                del self._history[history_length:]
+                logger.exception("Failed to generate Socratic dialogue response.")
+                raise
+
+            self._history.append(
+                DialogueTurn(
+                    role="agent",
+                    content=reply,
+                    timestamp=self._local_now().isoformat(),
+                )
+            )
+            payload: dict[str, object] = {
+                "user_message": user_message,
+                "assistant_reply": reply,
+                "session": session.strip() or self._session,
+                "scope": scope,
+                "turn_id": turn_id,
+            }
+            if binding is not None:
+                payload["dialogue_binding"] = binding.to_mapping()
+            self._queue_dialogue_learning(payload, binding=binding)
 
     def _queue_dialogue_learning(
         self,
@@ -379,6 +501,11 @@ class SocraticDialogue:
         ``persona_id`` is a server-frozen expression preference for chat only.
         It changes no tools or learning ownership. Non-natural presets override
         conflicting global expression rules; the current user's request wins.
+
+        Token streaming: when the loop's LLM service streams, ``delta``
+        events (incremental reply fragments) pass through between hops and
+        the ``final`` event; the recorded history reply still comes from
+        ``final`` only.
         """
         if self._learning_mode is DialogueLearningMode.QUEUED and self._settlement_queue is None:
             raise DialogueLearningConfigurationError(
@@ -397,11 +524,10 @@ class SocraticDialogue:
         async with self._respond_lock:
             history = self._agent_history(session_id, refresh_durable=bool(turn_id))
             history_length = len(history)
-            history.append(
-                DialogueTurn(
-                    role="user", content=user_message, timestamp=self._local_now().isoformat()
-                )
+            user_turn = DialogueTurn(
+                role="user", content=user_message, timestamp=self._local_now().isoformat()
             )
+            history.append(user_turn)
             try:
                 service = self._llm_service or self._build_service()
                 prompt_message = (
@@ -409,6 +535,12 @@ class SocraticDialogue:
                     if binding is not None
                     else user_message
                 )
+                link_result = await self._ingest_message_links(user_message)
+                if link_result is not None:
+                    if link_result.prompt_block:
+                        prompt_message = f"{prompt_message}\n\n{link_result.prompt_block}"
+                    if link_result.relation_hint:
+                        user_turn.relation_prefix = link_result.relation_hint
                 prompt_user_message = self._user_prompt_with_current_time(prompt_message)
                 # Explicitly saved notes are shared reference data, not system
                 # instructions or another conversation's transcript. Keep them
@@ -490,6 +622,23 @@ class SocraticDialogue:
             if binding is not None:
                 payload["dialogue_binding"] = binding.to_mapping()
             self._queue_dialogue_learning(payload, binding=binding)
+
+    async def _ingest_message_links(self, user_message: str) -> LinkIngestResult | None:
+        """Fetch links shared in the user message, never blocking the reply.
+
+        Returns ``None`` when no ingestor is wired, the message carries no
+        URLs, or ingestion itself raised — the turn then proceeds byte-
+        identical to the pre-ingest baseline (prompt-cache convention).
+        """
+        ingestor = self._link_ingestor
+        if ingestor is None or "://" not in user_message:
+            return None
+        try:
+            result = await ingestor.ingest(user_message)
+        except Exception:
+            logger.warning("Link ingestion failed; continuing without link context", exc_info=True)
+            return None
+        return result if result.links else None
 
     async def _respond_with_tools(
         self, service: Any, user_message: str, progress: Any = None

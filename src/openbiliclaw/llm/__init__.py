@@ -14,6 +14,7 @@ from .base import (
     classify_llm_failure_kind,
     classify_llm_unavailability,
 )
+from .cheaperinference_provider import CheaperInferenceProvider
 from .claude_provider import ClaudeProvider
 from .gemini_provider import GeminiProvider
 from .ollama_provider import OllamaProvider
@@ -37,6 +38,7 @@ from .service import (
 
 __all__ = [
     "ApiRouteProvider",
+    "CheaperInferenceProvider",
     "ClaudeProvider",
     "DeepSeekProvider",
     "GeminiProvider",

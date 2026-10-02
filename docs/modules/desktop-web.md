@@ -13,6 +13,8 @@
 
 LLM 实例设置页可选择 `api_route`（API Route），新实例预填 `gpt-5.5` 与 `https://global.api-route.com/v1`；模型发现、探测及保存沿用既有 OpenAI 兼容实例流程。首次运行 `/setup/` 向导也提供该选项与 API Key 入口。
 
+LLM 实例设置页可选择 `cheaperinference`（Cheaper Inference），新实例预填 `gpt-5.4-mini` 与 `https://api.cheaperinference.com/v1`；模型发现、探测及保存沿用既有 OpenAI 兼容实例流程。首次运行 `/setup/` 向导也提供该选项与 API Key 入口。
+
 | 任务 | 状态 | 说明 |
 |------|------|------|
 | M8 流式过程展示 | ✅ | `POST /api/chat/agent/stream` 真流式：thinking 过程文本 + 每步一行折叠工具摘要（可展开参数/结果）+ 审批卡内嵌；完成后整体折叠为「过程（N 步）」；`final` 落成答复气泡；历史回放从 `payload.agent_events` 重建同一视图 |
@@ -20,7 +22,8 @@ LLM 实例设置页可选择 `api_route`（API Route），新实例预填 `gpt-5
 | M8 skill 切换 | ✅ | 会话条 skill chip（图标+名称）弹出角色选择浮层（`GET /api/chat/skills`），按会话记忆选择、下一回合生效；`suggest_skill` 工具调用渲染为切换卡（一键切换/忽略） |
 | M8 审批卡 | ✅ | `approval_request` 渲染审批卡（summary+参数+impact，批准并执行/拒绝可填理由）；侧栏「待审批」入口带未读 badge（轮询 `?status=pending`，抽屉并列展示 executing 记录）；approve 端点异步执行：批准只入队，卡片就地转「执行中…」（按钮移除防重复点击），终态由 2.5s 轮询 `GET /api/chat/approvals`（executing 列表 + 全量快照）落到「已批准并执行」（含 result 摘要）或「已批准，但执行失败」（含 error 详情）；刷新/回放时 executing 记录覆盖归约出的 pending 卡恢复中间态；旧协议（响应无 `queued` 字段、同步返回 ok/result）按 `normalizeApproveResponse` 兜底直接显示结果；回放里 `approval_result` 显示审批结局与执行结果 |
 | M8 任务中心 | ✅ | 侧栏入口 + 右侧抽屉：任务列表（状态/进度/取消）、详情复用过程流组件渲染 `steps`、完成后 report + 建议清单（逐项确认：soft_write「确认执行」/ hard_write「去对话确认」，v1 统一落成来源会话里的结构化指令消息）；`start_background_task` 确认卡；`agent_task_summary` turn 渲染系统汇总卡 |
-| M8 回退与兼容 | ✅ | 探测 `GET /api/chat/skills` 失败 → legacy 模式（布局与行为与 M8 前完全一致）；agent 流 503（`loop_enabled=false`）时当轮回退旧 `/api/chat/stream` 假流式；delight/探针内嵌聊天、假设卡片、待聊确认、对话上下文引用等旧功能不动 |
+| M8 回退与兼容 | ✅ | 探测 `GET /api/chat/skills` 失败 → legacy 模式（布局与行为与 M8 前完全一致）；agent 流 503（`loop_enabled=false`）时当轮回退旧 `/api/chat/stream` 单跳流式；delight/探针内嵌聊天、假设卡片、待聊确认、对话上下文引用等旧功能不动 |
+| token 级流式渲染（issue #83） | ✅ | agent 流的 `delta` 事件逐 token 追加进实时回复气泡（`handleAgentStreamEvent` 直接累加 `live.replyText`；中间跳的 `thinking` 事件清空它、文本移入过程流，`final` / `done` 全文接管）；legacy 单跳流式沿用 `content` 增量渲染，后端换成真 delta 后自动受益 |
 | 会话与流结束隔离 | ✅ | SSE 必须收到 `done` 才确认完成，提前 EOF 走历史恢复；历史快照按来源会话与请求代次校验；live 回复只在来源会话展示，旧回合 `done.skill` 不覆盖用户中途切换的角色 |
 | 未发送草稿按会话隔离 | ✅ | 切换前保存当前输入，切回恢复对应草稿；新会话为空，发送或清空后不复活旧文字。草稿仅保存在本页面内存，不跨刷新或设备同步 |
 | 聊天风格选择 | ✅ | 顶部独立风格入口，六种单选模板、说明和同题预览；保存到当前会话，刷新/跨端同步，从新消息生效。保存期间阻止本会话抢先发送；晚到请求不覆盖新会话或已保存选择 |
@@ -74,7 +77,7 @@ web/desktop/
   `session_id` 与 `skill`）创建 pending turn，再消费
   `POST /api/chat/agent/stream` 的 SSE；每个事件经
   `OpenBiliClawChatAgentCore.createSseParser` 解析后 apply 进 live 过程模型并
-  重渲染。503 时 `legacyStreamForTurn()` 复用旧假流式端点完成同一 turn。
+  重渲染。503 时 `legacyStreamForTurn()` 复用旧单跳流式端点完成同一 turn。
   `streamAgentChatTurn()` 在缺少 `done`/明确 `error` 的 EOF 上抛出断连错误，
   不把仅有 `final` 的答复当作持久完成确认；live 对象保存发送时的会话和角色。
 - **历史**：agent 模式下 `refreshDialogueTurns()` 改拉

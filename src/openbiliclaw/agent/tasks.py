@@ -316,7 +316,10 @@ class AgentTaskRunner:
                 user_message=str(row["prompt"]),
                 tools=registry,
             ):
-                database.append_agent_task_step(task_id, step=event.to_dict())
+                # delta 片段只服务交互式 SSE 实时渲染；后台任务没有读者，
+                # 步骤日志只落完整步骤，文本由 thinking / final 全文重建。
+                if event.type != "delta":
+                    database.append_agent_task_step(task_id, step=event.to_dict())
                 if event.type == "final":
                     final_text = event.text
             report = final_text.strip() or "任务已结束，但没有产出文字报告；详见执行记录。"

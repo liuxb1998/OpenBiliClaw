@@ -12,10 +12,13 @@ import re
 import time
 from abc import ABC, abstractmethod
 from dataclasses import dataclass
-from typing import Any
+from typing import TYPE_CHECKING, Any
 from urllib.parse import urlsplit
 
 from openbiliclaw.diagnostics_alerts import record_diagnostics_alert
+
+if TYPE_CHECKING:
+    from collections.abc import AsyncIterator, Callable
 
 logger = logging.getLogger(__name__)
 
@@ -542,6 +545,21 @@ class HealthCheckResult:
     error: str | None = None
 
 
+@dataclass
+class LLMStreamChunk:
+    """One chunk of a streaming chat completion.
+
+    ``delta`` carries an incremental content fragment for live display.
+    The terminal chunk sets ``response`` to the aggregated LLMResponse,
+    which stays authoritative for full content, usage and tool calls;
+    consumers must not treat concatenated deltas as a substitute for it
+    (a fallback provider restart discards partial deltas).
+    """
+
+    delta: str = ""
+    response: LLMResponse | None = None
+
+
 class LLMProvider(ABC):
     """Abstract base class for LLM providers.
 
@@ -634,6 +652,77 @@ class LLMProvider(ABC):
         only providers that set ``supports_tool_calling = True`` override it.
         """
         raise LLMToolCallUnsupportedError(f"{self.name} does not implement native tool calling.")
+
+    async def stream_complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        json_mode: bool = False,
+        reasoning_effort: str | None = None,
+        model: str | None = None,
+    ) -> AsyncIterator[LLMStreamChunk]:
+        """Stream a chat completion as incremental content chunks.
+
+        Args:
+            messages: Chat messages in OpenAI format [{role, content}].
+            temperature: Sampling temperature.
+            max_tokens: Maximum tokens in response.
+            json_mode: Whether to request structured JSON output.
+            reasoning_effort: Same contract as ``complete()``.
+            model: Optional per-call model override.
+
+        Yields:
+            ``LLMStreamChunk`` items: zero or more content ``delta`` chunks
+            followed by exactly one terminal chunk carrying the aggregated
+            ``response``.
+
+        The default implementation is a one-shot fallback over
+        ``complete()`` so every existing provider keeps working unchanged;
+        providers with a real streaming API override it.
+        """
+        response = await self.complete(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            json_mode=json_mode,
+            reasoning_effort=reasoning_effort,
+            model=model,
+        )
+        if response.content:
+            yield LLMStreamChunk(delta=response.content)
+        yield LLMStreamChunk(response=response)
+
+    async def stream_complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
+        model: str | None = None,
+    ) -> AsyncIterator[LLMStreamChunk]:
+        """Stream a chat completion with native function calling.
+
+        Same chunk contract as ``stream_complete``; the terminal chunk's
+        response may carry ``tool_calls``. The default implementation is a
+        one-shot fallback over ``complete_with_tools()`` (and therefore
+        raises ``LLMToolCallUnsupportedError`` for providers without native
+        function calling, matching the non-streaming contract).
+        """
+        response = await self.complete_with_tools(
+            messages,
+            tools,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+            model=model,
+        )
+        if response.content:
+            yield LLMStreamChunk(delta=response.content)
+        yield LLMStreamChunk(response=response)
 
     async def health_check(self) -> bool:
         """Check if the provider is accessible.
@@ -1122,6 +1211,317 @@ class LLMRegistry:
                 source=target,
             )
             raise
+
+    async def stream_complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        json_mode: bool = False,
+        reasoning_effort: str | None = None,
+    ) -> AsyncIterator[LLMStreamChunk]:
+        """Stream a completion request with sequential provider fallback."""
+        async for chunk in self.stream_chain(
+            self._fallback_order(),
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            json_mode=json_mode,
+            reasoning_effort=reasoning_effort,
+        ):
+            yield chunk
+
+    async def stream_chain(
+        self,
+        instance_ids: list[str] | tuple[str, ...],
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        json_mode: bool = False,
+        reasoning_effort: str | None = None,
+    ) -> AsyncIterator[LLMStreamChunk]:
+        """Stream one explicit ordered instance chain.
+
+        Mirrors ``complete_chain``'s cooldown / fall-through semantics with
+        one streaming-specific rule: a provider may only hand over to the
+        next fallback *before* it emitted any content delta — once deltas
+        reached the caller, falling back would duplicate text, so the
+        failure propagates instead.
+        """
+
+        def _stream(provider: LLMProvider) -> AsyncIterator[LLMStreamChunk]:
+            return provider.stream_complete(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                json_mode=json_mode,
+                reasoning_effort=reasoning_effort,
+            )
+
+        async for chunk in self._stream_chain(instance_ids, stream_fn=_stream):
+            yield chunk
+
+    async def stream_provider(
+        self,
+        provider_name: str,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        json_mode: bool = False,
+        reasoning_effort: str | None = None,
+        model: str | None = None,
+    ) -> AsyncIterator[LLMStreamChunk]:
+        """Stream a completion against one exact chat-capable provider.
+
+        Same no-fallback contract as ``complete_provider``: an explicit
+        per-module route must not silently spill into another provider.
+        """
+        target = provider_name.strip().lower()
+        if not self.is_chat_capable(target):
+            available = ", ".join(self._fallback_order())
+            raise LLMFallbackError(
+                f"LLM provider '{target or provider_name}' is not registered "
+                f"or not chat-capable. Chat-capable providers: {available}"
+            )
+        if self._provider_on_cooldown(target):
+            logger.warning("Provider %s is cooling down after rate limit.", target)
+            raise LLMRateLimitError(f"Provider {target} is cooling down after rate limit.")
+
+        provider = self.get(target)
+        try:
+            async for chunk in provider.stream_complete(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                json_mode=json_mode,
+                reasoning_effort=reasoning_effort,
+                model=model,
+            ):
+                if chunk.response is not None:
+                    chunk.response.instance_id = target
+                yield chunk
+        except LLMRateLimitError:
+            self._mark_rate_limited(target)
+            logger.warning("Provider %s rate-limited exact routed call.", target)
+            record_diagnostics_alert(
+                category="llm",
+                code="rate_limited",
+                message=f"LLM 实例 {target} 被限流（HTTP 429），精确路由调用失败。",
+                source=target,
+            )
+            raise
+        self._rate_limited_until.pop(target, None)
+        self._rate_limit_attempts.pop(target, None)
+
+    async def stream_complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
+    ) -> AsyncIterator[LLMStreamChunk]:
+        """Stream a native function-calling completion over the fallback chain."""
+        async for chunk in self.stream_with_tools_chain(
+            self._fallback_order(),
+            messages,
+            tools,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            reasoning_effort=reasoning_effort,
+        ):
+            yield chunk
+
+    async def stream_with_tools_chain(
+        self,
+        instance_ids: list[str] | tuple[str, ...],
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
+    ) -> AsyncIterator[LLMStreamChunk]:
+        """Stream one explicit ordered chain with native function calling.
+
+        Mirrors ``complete_with_tools_chain``: providers without
+        ``supports_tool_calling`` are skipped, and if none of the routed
+        instances supports native FC the method raises
+        ``LLMToolCallUnsupportedError`` (before any chunk) so the service
+        layer can fall back to prompt-level simulation. The pre-delta-only
+        fallback rule of ``stream_chain`` applies.
+        """
+
+        def _stream(provider: LLMProvider) -> AsyncIterator[LLMStreamChunk]:
+            return provider.stream_complete_with_tools(
+                messages,
+                tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+            )
+
+        async for chunk in self._stream_chain(
+            instance_ids,
+            stream_fn=_stream,
+            require_tool_support=True,
+        ):
+            yield chunk
+
+    async def stream_provider_with_tools(
+        self,
+        provider_name: str,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
+        model: str | None = None,
+    ) -> AsyncIterator[LLMStreamChunk]:
+        """Stream a native function-calling completion against one provider.
+
+        Same no-fallback contract as ``complete_provider_with_tools``.
+        """
+        target = provider_name.strip().lower()
+        if not self.is_chat_capable(target):
+            available = ", ".join(self._fallback_order())
+            raise LLMFallbackError(
+                f"LLM provider '{target or provider_name}' is not registered "
+                f"or not chat-capable. Chat-capable providers: {available}"
+            )
+        if not self.provider_supports_tool_calling(target):
+            raise LLMToolCallUnsupportedError(
+                f"LLM provider '{target}' does not support native tool calling."
+            )
+        if self._provider_on_cooldown(target):
+            logger.warning("Provider %s is cooling down after rate limit.", target)
+            raise LLMRateLimitError(f"Provider {target} is cooling down after rate limit.")
+
+        provider = self.get(target)
+        try:
+            async for chunk in provider.stream_complete_with_tools(
+                messages,
+                tools,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                reasoning_effort=reasoning_effort,
+                model=model,
+            ):
+                if chunk.response is not None:
+                    chunk.response.instance_id = target
+                yield chunk
+        except LLMRateLimitError:
+            self._mark_rate_limited(target)
+            logger.warning("Provider %s rate-limited exact routed call.", target)
+            record_diagnostics_alert(
+                category="llm",
+                code="rate_limited",
+                message=f"LLM 实例 {target} 被限流（HTTP 429），精确路由调用失败。",
+                source=target,
+            )
+            raise
+        self._rate_limited_until.pop(target, None)
+        self._rate_limit_attempts.pop(target, None)
+
+    async def _stream_chain(
+        self,
+        instance_ids: list[str] | tuple[str, ...],
+        *,
+        stream_fn: Callable[[LLMProvider], AsyncIterator[LLMStreamChunk]],
+        require_tool_support: bool = False,
+    ) -> AsyncIterator[LLMStreamChunk]:
+        """Drive one streaming chain with pre-delta fallback semantics."""
+        last_error: Exception | None = None
+        attempted: list[str] = []
+        seen: set[str] = set()
+        order: list[str] = []
+        for raw_name in instance_ids:
+            instance_id = str(raw_name or "").strip().lower()
+            if not instance_id or instance_id in seen or not self.is_chat_capable(instance_id):
+                continue
+            seen.add(instance_id)
+            order.append(instance_id)
+
+        supports_any = False
+        for position, provider_name in enumerate(order):
+            has_next = position + 1 < len(order)
+            provider = self.get(provider_name)
+            if require_tool_support and not getattr(provider, "supports_tool_calling", False):
+                logger.debug(
+                    "Provider %s has no native tool calling; skipping in FC chain.",
+                    provider_name,
+                )
+                continue
+            supports_any = True
+            attempted.append(provider_name)
+            if self._provider_on_cooldown(provider_name):
+                last_error = LLMRateLimitError(
+                    f"Provider {provider_name} is cooling down after rate limit."
+                )
+                logger.warning("Provider %s is cooling down after rate limit.", provider_name)
+                continue
+            emitted_delta = False
+            try:
+                async for chunk in stream_fn(provider):
+                    if chunk.delta:
+                        emitted_delta = True
+                    if chunk.response is not None:
+                        chunk.response.instance_id = provider_name
+                    yield chunk
+            except LLMRateLimitError as exc:
+                if emitted_delta:
+                    # Partial content already reached the caller; retrying
+                    # on another provider would duplicate text.
+                    raise
+                last_error = exc
+                self._mark_rate_limited(provider_name)
+                self._log_provider_failure(provider_name, has_next=has_next)
+                record_diagnostics_alert(
+                    category="llm",
+                    code="rate_limited",
+                    message=str(exc) or "LLM provider returned HTTP 429 (rate limited).",
+                    source=provider_name,
+                )
+            # LLMResponseError falls through like any other failure — see
+            # ``complete_chain`` for the rationale.
+            except (LLMProviderError, LLMTimeoutError) as exc:
+                if emitted_delta:
+                    raise
+                last_error = exc
+                self._log_provider_failure(provider_name, has_next=has_next)
+                record_diagnostics_alert(
+                    category="llm",
+                    code=_classify_llm_error_code(exc),
+                    message=str(exc),
+                    source=provider_name,
+                )
+            else:
+                self._rate_limited_until.pop(provider_name, None)
+                self._rate_limit_attempts.pop(provider_name, None)
+                return
+
+        if require_tool_support and not supports_any:
+            raise LLMToolCallUnsupportedError(
+                "No chat-capable provider in the route supports native tool calling."
+            )
+        attempted_list = ", ".join(attempted)
+        if last_error is None:
+            raise LLMFallbackError("No provider was available to process the request.")
+        record_diagnostics_alert(
+            category="llm",
+            code="all_providers_failed",
+            message=f"所有 LLM 实例均请求失败（{attempted_list}），最后错误：{last_error}",
+            source=attempted_list,
+            severity="error",
+        )
+        raise LLMFallbackError(
+            f"All providers failed ({attempted_list}). Last error: {last_error}"
+        ) from last_error
 
     async def health_check_all(self) -> dict[str, HealthCheckResult]:
         """Run health checks for all registered chat-capable providers."""

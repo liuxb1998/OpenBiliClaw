@@ -744,6 +744,9 @@ def test_human_install_choice_parser_accepts_numbers_and_aliases() -> None:
     assert bootstrap.resolve_human_llm_choice("9") == "api_route"
     assert bootstrap.resolve_human_llm_choice("api_route") == "api_route"
     assert bootstrap.PROVIDER_MODEL_DEFAULTS["api_route"] == "gpt-5.5"
+    assert bootstrap.resolve_human_llm_choice("10") == "cheaperinference"
+    assert bootstrap.resolve_human_llm_choice("cheaperinference") == "cheaperinference"
+    assert bootstrap.PROVIDER_MODEL_DEFAULTS["cheaperinference"] == "gpt-5.4-mini"
     assert bootstrap.resolve_human_llm_choice("relay") == "openai_compatible"
     assert bootstrap.resolve_human_llm_choice("ollama") == "ollama"
     assert bootstrap.resolve_human_llm_choice("bad") is None

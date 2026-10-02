@@ -23,6 +23,7 @@ from openbiliclaw.llm.base import (
     LLMTimeoutError,
     is_reasoning_budget_exhausted,
 )
+from openbiliclaw.llm.cheaperinference_provider import CheaperInferenceProvider
 from openbiliclaw.llm.claude_provider import ClaudeProvider
 from openbiliclaw.llm.gemini_provider import GeminiProvider, gemini_sdk_available
 from openbiliclaw.llm.ollama_provider import OllamaProvider
@@ -1621,6 +1622,64 @@ async def test_api_route_provider_uses_per_call_model_without_reasoning_param(
     assert "reasoning_effort" not in captured
     assert "extra_body" not in captured
     assert provider._model == "gpt-5.5"
+
+
+def test_cheaperinference_provider_defaults() -> None:
+    provider = CheaperInferenceProvider(api_key="ci_live_test")
+
+    assert provider.name == "cheaperinference"
+    assert provider.base_url == "https://api.cheaperinference.com/v1"
+    assert provider._model == "gpt-5.4-mini"
+    assert provider.supports_embedding is False
+    assert provider._openai_reasoning_effort("gpt-5.4-mini", "high") is None
+
+
+@pytest.mark.asyncio
+async def test_cheaperinference_provider_uses_per_call_model_without_reasoning_param(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = CheaperInferenceProvider(api_key="ci_live_test")
+    captured: dict[str, object] = {}
+
+    async def fake_request(**kwargs: object) -> SimpleNamespace:
+        captured.update(kwargs)
+        return _openai_response("cheaperinference-ok")
+
+    monkeypatch.setattr(provider, "_request_with_retry", fake_request)
+    response = await provider.complete(
+        [{"role": "user", "content": "hi"}],
+        model="claude-sonnet-5",
+        reasoning_effort="high",
+    )
+
+    assert response.content == "cheaperinference-ok"
+    assert captured["model"] == "claude-sonnet-5"
+    assert "reasoning_effort" not in captured
+    assert "extra_body" not in captured
+    assert provider._model == "gpt-5.4-mini"
+
+
+@pytest.mark.asyncio
+async def test_cheaperinference_list_models_keeps_only_text_models(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    provider = CheaperInferenceProvider(api_key="ci_live_test")
+
+    async def fake_catalog() -> SimpleNamespace:
+        return SimpleNamespace(
+            data=[
+                SimpleNamespace(id="gpt-5.4-mini", type="text"),
+                SimpleNamespace(id="claude-sonnet-5", type="text"),
+                SimpleNamespace(id="image-model", type="image"),
+                SimpleNamespace(id="video-model", type="video"),
+                SimpleNamespace(id="untyped-model"),
+                SimpleNamespace(id="", type="text"),
+            ]
+        )
+
+    monkeypatch.setattr(provider, "_create_model_list", fake_catalog)
+
+    assert await provider.list_models() == ["claude-sonnet-5", "gpt-5.4-mini", "untyped-model"]
 
 
 def test_requesty_provider_accepts_regional_base_url() -> None:

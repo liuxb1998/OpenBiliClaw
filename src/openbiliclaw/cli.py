@@ -1019,12 +1019,22 @@ def _build_recommendation_engine() -> Any:
 def _build_dialogue(soul_engine: Any) -> Any:
     """Build the Socratic dialogue helper for interactive chat."""
     from openbiliclaw.soul.dialogue import DialogueLearningMode, SocraticDialogue
+    from openbiliclaw.sources.link_ingest import LinkIngestor
 
+    # Chat link ingestion (issue #83): same LinkIngestor as the Web chat lane —
+    # B站链接走 /view 元数据,其余平台抓 og 元数据,抓取成功的链接经
+    # propagate_event 记入统一兴趣线(share 显式正向信号)。
+    propagate_event = getattr(getattr(soul_engine, "_memory", None), "propagate_event", None)
+    link_ingestor = LinkIngestor(
+        bilibili_client=_build_bilibili_client(),
+        event_sink=propagate_event if callable(propagate_event) else None,
+    )
     return SocraticDialogue(
         llm=_build_registry(),
         soul_engine=soul_engine,
         session="cli",
         learning_mode=DialogueLearningMode.LEGACY_DIRECT,
+        link_ingestor=link_ingestor,
     )
 
 
@@ -1945,6 +1955,11 @@ _PROVIDER_DEFAULTS: dict[str, dict[str, str]] = {
     # Requesty: OpenAI-compatible LLM gateway.
     "requesty": {"base_url": "https://router.requesty.ai/v1", "model": "openai/gpt-4o-mini"},
     "api_route": {"base_url": "https://global.api-route.com/v1", "model": "gpt-5.5"},
+    # Cheaper Inference: OpenAI-compatible LLM gateway (ci_live_ key).
+    "cheaperinference": {
+        "base_url": "https://api.cheaperinference.com/v1",
+        "model": "gpt-5.4-mini",
+    },
 }
 
 
@@ -1958,6 +1973,7 @@ _PROVIDER_HINTS: dict[str, str] = {
     "orcarouter": "OrcaRouter 聚合（OpenAI 兼容协议）",
     "requesty": "Requesty 聚合（OpenAI 兼容协议）",
     "api_route": "API Route 聚合（OpenAI 兼容协议）",
+    "cheaperinference": "Cheaper Inference 聚合（OpenAI 兼容协议）",
 }
 
 
@@ -1999,6 +2015,10 @@ _PROVIDER_MODEL_HINT: dict[str, str] = {
         "如 anthropic/claude-sonnet-4-5 / google/gemini-2.5-flash"
     ),
     "api_route": "默认 gpt-5.5。也可填写 API Route 支持的其他模型 ID。",
+    "cheaperinference": (
+        "默认 gpt-5.4-mini。Cheaper Inference 模型名不带厂商前缀,"
+        "如 gpt-5.4 / claude-sonnet-5 / gemini-3.1-pro"
+    ),
     "ollama": (
         "常见模型: qwen2.5:7b (默认 / 中文好) / llama3.2 (Meta 新版) / "
         "gemma2 (Google) / mistral (轻量) / deepseek-r1 (开源推理)。"
@@ -2501,6 +2521,7 @@ _SUPPORTED_PROVIDERS: tuple[str, ...] = (
     "orcarouter",
     "requesty",
     "api_route",
+    "cheaperinference",
 )
 
 
@@ -2563,6 +2584,11 @@ _LLM_MENU: tuple[tuple[str, str, str], ...] = (
         "api_route",
         "API Route 聚合",
         "默认 gpt-5.5。一个 Key 跑多家模型,按调用计费",
+    ),
+    (
+        "cheaperinference",
+        "Cheaper Inference 聚合",
+        "默认 gpt-5.4-mini。一个 Key 跑多家模型,按调用计费",
     ),
 )
 
@@ -2998,7 +3024,12 @@ def _interactive_embedding_setup(default_provider: str, *, auto_if_ready: bool =
             .strip()
             .lower()
         )
-        if target not in _SUPPORTED_PROVIDERS or target in {"orcarouter", "requesty", "api_route"}:
+        if target not in _SUPPORTED_PROVIDERS or target in {
+            "orcarouter",
+            "requesty",
+            "api_route",
+            "cheaperinference",
+        }:
             console.print("[red]未知或没有 embedding 接口的 provider,跳过 embedding 配置。[/red]")
             return
         defaults = _PROVIDER_DEFAULTS.get(target, {})
@@ -16206,6 +16237,31 @@ def discover(
         _print_discovered_content_preview(item, index)
 
 
+async def _stream_dialogue_reply(dialogue: Any, user_message: str) -> str:
+    """Print one chat reply token by token and return the full text.
+
+    Deltas print without markup/highlight parsing and without newlines so
+    the reply types out inline after a single ``阿花：`` prefix. Dialogue
+    doubles without ``respond_stream`` fall back to the one-shot print.
+    """
+    stream_fn = getattr(dialogue, "respond_stream", None)
+    if not callable(stream_fn):
+        reply = str(await dialogue.respond(user_message))
+        console.print(f"阿花：{reply}")
+        return reply
+    parts: list[str] = []
+    printed_prefix = False
+    async for delta in stream_fn(user_message):
+        if not printed_prefix:
+            console.print("阿花：", end="")
+            printed_prefix = True
+        console.print(str(delta), end="", markup=False, highlight=False)
+        parts.append(str(delta))
+    if printed_prefix:
+        console.print()
+    return "".join(parts)
+
+
 @app.command()
 def chat() -> None:
     """与 Agent 对话（苏格拉底式深度交流）."""
@@ -16224,26 +16280,41 @@ def chat() -> None:
         raise typer.Exit(code=1) from exc
 
     dialogue = _build_dialogue(soul_engine)
-    _print_page_title("苏格拉底式对话", "输入 exit / quit / 空行结束")
+    from openbiliclaw.cli_input import (
+        MULTILINE_HINT,
+        build_multiline_session,
+        is_chat_exit_command,
+        supports_multiline_prompt,
+    )
+
+    multiline_session = (
+        build_multiline_session() if supports_multiline_prompt(sys.stdin, sys.stdout) else None
+    )
+    subtitle = "输入 exit / quit / 空行结束"
+    if multiline_session is not None:
+        subtitle += f"；{MULTILINE_HINT}"
+    _print_page_title("苏格拉底式对话", subtitle)
 
     try:
         while True:
             try:
-                user_message = typer.prompt("你", prompt_suffix="： ").strip()
+                if multiline_session is not None:
+                    user_message = multiline_session.prompt("你： ").strip()
+                else:
+                    user_message = typer.prompt("你", prompt_suffix="： ").strip()
             except (click.Abort, EOFError, KeyboardInterrupt):
                 console.print("阿花：对话结束。")
                 return
 
-            if user_message.lower() in {"", "exit", "quit"}:
+            if is_chat_exit_command(user_message):
                 console.print("阿花：对话结束。")
                 return
 
             try:
-                reply = asyncio.run(dialogue.respond(user_message))
+                asyncio.run(_stream_dialogue_reply(dialogue, user_message))
             except Exception as exc:
                 console.print(f"阿花：{safe_llm_failure_message(exc)}")
                 continue
-            console.print(f"阿花：{reply}")
     except KeyboardInterrupt:
         console.print("阿花：对话结束。")
 

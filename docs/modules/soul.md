@@ -56,6 +56,8 @@
 | Agent 显式聊天笔记 | ✅ | 通过 LLMService.memory 读取有界 agent_notes，仅 chat 且角色允许 read_memory 时加入 user 引用；原消息、system 与学习载荷不变 |
 | Agent 表达风格 | ✅ | `stream_agent_reply(persona_id=...)` 为 chat scope 叠加已冻结的表达模板；natural、legacy 与非 chat 保持原 prompt，风格不更改学习输入或权限 |
 | SocraticDialogue.stream_agent_reply()（M2） | ✅ | 多跳 agent loop 的对话侧入口（`POST /api/chat/agent/stream` 调用）：在 `_respond_lock` 下与 `respond()` 串行，复用共享朋友人设与长期记忆，采用按当前请求调整深度的聊天风格（简单问题简答、复杂任务充分展开，访谈追问由 skill 决定）；显式 `session_id` 的短期历史按会话隔离，首次使用从本会话 durable rows 恢复；`dialogue_binding` 同时用于 prompt 和学习冻结锚；user turn 先 append（loop 异常/空答复回滚本轮且不触发学习），完成后 append agent 答复并按 learning mode 走与 `respond()` 相同的 `_queue_dialogue_learning()` 提交（queued / legacy_direct / reply_only_test 语义一致） |
+| SocraticDialogue.respond_stream()（issue #83） | ✅ | `respond()` 的流式变体：逐 token yield 回复增量（`LLMService.stream_socratic_dialogue()`），历史追加 / 回滚 / 学习语义与 `respond()` 完全一致；工具回合保持一次性工具流、最终回复作为单个 delta 吐出；service 缺少流式方法时回退一次性 `complete_socratic_dialogue()`。CLI `chat` 与 legacy `/api/chat/stream` 均走此路径 |
+| 对话内链接摄入（issue #83，`sources/link_ingest.py`） | ✅ | `SocraticDialogue` 可选接收 `LinkIngestor`；`respond()`、`respond_stream()` 与 `stream_agent_reply()` 在 user turn append 后、LLM 调用前对消息做链接预处理：提取 URL（无 `://` 快速短路）→ 展开 b23.tv / xhslink.com 短链（跟随重定向，8s 超时 + 256 KiB 上限 + 非 HTML 拒绝，httpx 一律 `trust_env=False`）→ 按 `sources/platforms.py` 注册表识别平台（bilibili 复用 `BilibiliAPIClient.get_video_info` 拿标题/简介/UP 主/标签，其余平台抓 title/description/og 元数据）→ 摘要块注入当轮 prompt（历史与审计仍存用户原文，仅靠 `relation_prefix` 让后续轮次知道「分享了链接《…》」），并把每个抓取成功的链接经注入的 `event_sink`（生产 = `MemoryManager.propagate_event`）记为 `share` 事件（显式正向偏好，默认强度 0.85，用户消息摘录进 `comment_text`）。单链接失败降级为「仅链接」形态进上下文，事件写入失败只记 WARNING，绝不阻塞聊天；未接 ingestor 时 prompt 逐字节不变 |
 | ProfileBuilder 历史抽样（2026-07-26+） | ✅ | `_summarize_history` 不再按到达顺序切`titles[:100]` / `contexts[:100]` / `recent|older[:50]`——真实拉取顺序是最新在前，1000 条历史里模型只看得到最近约 100 条，再久的长期兴趣无论互动多强都不可见（实测生产数据：旧法只覆盖**最近 0.6 天**，且漏掉了全量里唯一一条收藏）。现按「强信号保底 + 时间分层」抽样，与增量链路同源判据：① 权重复用满意度语义——明确互动（收藏/点赞/投币…）3.0 > 高完播 2.0 > 一般 1.0 > 划走 0.3（不归零，划走也是信号）；② 先用 `_HISTORY_STRONG_RESERVE=0.4` 的预算无条件收下明确互动（避免一段时间内集中的收藏被其他时间桶的配额挤掉，与「疑惑被高置信假设埋掉」同类问题），余额再按 `_HISTORY_TIME_BUCKETS=6` 个时间桶均摊，薄桶剩余配额回流给最有代表性的行为；③ 输出按时间排序，`count` 仍报真实总量并附 `sampling_hint` 告知模型这是抽样。无有效时间戳（超过半数缺失）时退回到达顺序，不丢数据。**未改动**：`analyze_events` 的偏好分片仍是 `events[i:i+200]` 全量覆盖，init 的觉察/洞察（`_init_cognition_context`）也无截断——截断问题只存在于画像构建的历史摘要这一处 |
 | ProfileBuilder | ✅ | 结构化 prompt + JSON 校验 + `OnionProfile` 构建；`build_soul_profile_prompt()` 的 system prompt 保持静态，user prompt 按 `<tone_profile>` → `<preference_summary>` → `<recent_awareness>` → `<active_insights>` → `<history_summary>` 排列并使用确定性 JSON，让超大的历史摘要位于 provider cache 前缀末端 |
 | SoulEngine.build_initial_profile() | ✅ | 从 history + preference 生成并持久化 `soul.json` |
@@ -1429,3 +1431,7 @@ tone = build_tone_profile(
 
 **未改动**：深层重建的准入仍是 `validated AND confidence >= _REBUILD_MIN_CONFIDENCE(0.75)` 的与门——
 事件只能影响置信度，给不了 `validated`，因此「事件自动下沉深层」依然不成立（深层线归一的边界未变）。
+
+### 2026-10-02 流式链接一致性
+
+`respond_stream()` 与 `respond()`、`stream_agent_reply()` 一样摄取当轮用户链接并注入元数据；原始消息、卡片绑定和学习输入保持原值，历史用关系前缀表达分享。无链接不调用摄取器，摄取失败不阻断回复。

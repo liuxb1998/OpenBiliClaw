@@ -39,7 +39,7 @@ for (const surface of ["desktop", "mobile", "popup"]) {
       lastChatHistorySignature: null, dialogueTurnsById: new Map(), setChatSubtab() {},
       hydrateChatHistory: async () => {}, renderChatSkillSelect() {},
       historyRefreshGeneration: 0, historyRefreshInFlight: false, lastHistorySignature: null,
-      streamingTurnIds: new Set(), agentRunsByTurnId: new Map(), renderAgentOverlays() {}, render() {},
+      streamingTurnIds: new Set(), agentRunsByTurnId: new Map(), agentDeltaBuffers: new Map(), renderAgentOverlays() {}, render() {},
       loadHistory: async () => {},
     });
     const name = surface === "desktop" ? "selectChatSession" : surface === "mobile" ? "switchSession" : "switchPopupChatSession";
@@ -243,7 +243,7 @@ test("mobile late turn creation does not lock a different session or change its 
   let sent;
   const context = vm.createContext({
     activeSessionId: "b", turns: [], sending: false,
-    streamingTurnIds: new Set(), agentRunsByTurnId: new Map(),
+    streamingTurnIds: new Set(), agentRunsByTurnId: new Map(), agentDeltaBuffers: new Map(),
     sessionSkillMap: { a: "system-steward" },
     createAgentRun: () => ({}),
     streamAgentChatTurn: body => { sent = body; return stream.promise; },

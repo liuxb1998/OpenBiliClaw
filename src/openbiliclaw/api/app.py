@@ -1099,6 +1099,7 @@ _RESETTABLE_CONFIG_FIELDS = {
     "llm.orcarouter.api_key": ("llm", "orcarouter", "api_key"),
     "llm.requesty.api_key": ("llm", "requesty", "api_key"),
     "llm.api_route.api_key": ("llm", "api_route", "api_key"),
+    "llm.cheaperinference.api_key": ("llm", "cheaperinference", "api_key"),
     "llm.openai_compatible.api_key": ("llm", "openai_compatible", "api_key"),
     "llm.embedding.api_key": ("llm", "embedding", "api_key"),
 }
@@ -11529,15 +11530,23 @@ def create_app(
 
         When a ``turn_id`` is supplied, the client has already created a
         pending durable turn with ``streaming=True``; this endpoint completes
-        that turn while streaming deltas. Without a turn_id it falls back to a
-        non-persistent legacy response.
+        that turn while streaming real token deltas (``content`` events) via
+        ``SocraticDialogue.respond_stream``. Without a turn_id it falls back
+        to a non-persistent legacy response.
         """
         message = payload.message.strip()
         if not message:
             raise HTTPException(status_code=422, detail="Chat message is required.")
         turn_id = payload.turn_id.strip()
         row = _get_chat_turn_row(turn_id) if turn_id else None
+        if turn_id and row is None:
+            raise HTTPException(status_code=404, detail="Chat turn not found.")
         turn = _normalize_chat_turn(row) if row else None
+        if turn is not None and (
+            message != turn.message
+            or (payload.session_id.strip() and payload.session_id.strip() != turn.session_id)
+        ):
+            _dialogue_context_error(409, "turn_id_conflict", "Chat turn request conflicts.")
 
         progress_events: list[tuple[str, dict[str, object]]] = []
 
@@ -11554,6 +11563,43 @@ def create_app(
                 )
             )
 
+        async def _respond_deltas(dialogue_owner: Any) -> AsyncIterator[str]:
+            """Yield real reply deltas via ``respond_stream``.
+
+            Dialogue owners without ``respond_stream`` (duck-typed doubles)
+            fall back to the one-shot ``respond`` and yield its reply once.
+            """
+            stream_fn = getattr(dialogue_owner, "respond_stream", None)
+            if not callable(stream_fn):
+                yield await _respond(dialogue_owner)
+                return
+            if turn is not None:
+                respond_kwargs: dict[str, object] = {
+                    "scope": turn.scope or "chat",
+                    "turn_id": turn.turn_id,
+                }
+                binding = _binding_from_turn(turn)
+                respond_parameters: Mapping[str, inspect.Parameter] = {}
+                try:
+                    respond_parameters = inspect.signature(stream_fn).parameters
+                except (TypeError, ValueError):
+                    respond_parameters = {}
+                if "session" in respond_parameters:
+                    respond_kwargs["session"] = turn.session
+                if binding is not None and "dialogue_binding" in respond_parameters:
+                    respond_kwargs["dialogue_binding"] = binding
+                if "progress" in respond_parameters:
+                    respond_kwargs["progress"] = _progress
+                iterator = stream_fn(_contextual_chat_message(turn), **respond_kwargs)
+            else:
+                iterator = stream_fn(message, progress=_progress)
+            while True:
+                try:
+                    delta = await asyncio.wait_for(iterator.__anext__(), timeout=120)
+                except StopAsyncIteration:
+                    break
+                yield str(delta)
+
         async def _event_stream() -> AsyncIterator[str]:
             import json as _json
 
@@ -11561,21 +11607,59 @@ def create_app(
                 return f"event: {event}\ndata: {_json.dumps(data, ensure_ascii=False)}\n\n"
 
             yield sse("phase", {"phase": "thinking", "text": "正在思考…"})
+            reply_parts: list[str] = []
+            progress_index = 0
+
+            def _drain_progress() -> list[tuple[str, dict[str, object]]]:
+                nonlocal progress_index
+                pending = progress_events[progress_index:]
+                progress_index = len(progress_events)
+                return pending
+
             try:
-                reply = await _run_with_dialogue_execution(_respond)
+                async with _dialogue_execution_lease() as current_dialogue:
+                    # Polling recovery or another stream may have completed this
+                    # durable turn while this request waited for the lease. Reuse
+                    # that result before link ingestion or post-reply learning.
+                    if turn_id:
+                        latest_row = _get_chat_turn_row(turn_id)
+                        latest = _normalize_chat_turn(latest_row) if latest_row else None
+                        if latest is None:
+                            yield sse("error", {"error": "Chat turn not found."})
+                            return
+                        if latest.status != "pending":
+                            reply = latest.error if latest.status == "failed" else latest.reply
+                            yield sse("content", {"delta": reply})
+                            yield sse("done", {"reply": reply})
+                            return
+                    try:
+                        async for delta in _respond_deltas(current_dialogue):
+                            # Tool-phase progress events are produced between
+                            # deltas; flush them first so they never render
+                            # after the reply text they precede.
+                            for event, data in _drain_progress():
+                                yield sse(event, data)
+                            reply_parts.append(delta)
+                            yield sse("content", {"delta": delta})
+                    except Exception as exc:
+                        logger.exception("Chat stream dialogue failed")
+                        reply_parts = [safe_llm_failure_message(exc)]
+                        yield sse("content", {"delta": reply_parts[0]})
+                    reply = "".join(reply_parts)
+                    # Keep completion in the execution lease: releasing it first
+                    # lets the durable worker observe pending and repeat effects.
+                    if turn is not None and turn_id:
+                        _complete_chat_turn_row(turn_id, reply=reply)
             except Exception as exc:
-                logger.exception("Chat stream dialogue failed")
+                # Preserve the legacy SSE envelope even when admission or
+                # persistence fails. Leave pending rows recoverable; never
+                # force completion outside the execution lease.
+                logger.exception("Chat stream admission or persistence failed")
                 reply = safe_llm_failure_message(exc)
+                yield sse("content", {"delta": reply})
 
-            if turn is not None and turn_id:
-                _complete_chat_turn_row(turn_id, reply=reply)
-
-            for event, data in progress_events:
+            for event, data in _drain_progress():
                 yield sse(event, data)
-            await asyncio.sleep(0.15)
-            for i in range(0, len(reply), 18):
-                yield sse("content", {"delta": reply[i : i + 18]})
-                await asyncio.sleep(0.015)
             yield sse("done", {"reply": reply})
 
         return StreamingResponse(
@@ -11595,9 +11679,13 @@ def create_app(
 
         Runs ``AgentLoop`` under the app-wide dialogue execution lease and
         forwards every ``AgentEvent`` as one SSE event named by its type
-        (``thinking`` / ``tool_call`` / ``tool_result`` /
+        (``thinking`` / ``tool_call`` / ``tool_result`` / ``delta`` /
         ``step_limit_reached`` / ``final``), followed by a terminal ``done``
-        carrying the final reply. LLM failures map to a single ``error``
+        carrying the final reply. ``delta`` events carry incremental reply
+        fragments (``text``) for live rendering; they are never persisted
+        into ``payload.agent_events``, and older clients may safely ignore
+        them since ``thinking`` / ``final`` still carry the full text. LLM
+        failures map to a single ``error``
         event. Lease admission is bounded (30s): while a config hot reload
         holds the dialogue lane, the stream ends with one ``error`` event
         ("系统正在重载配置，请稍后再试") instead of hanging, and a durable
@@ -11748,7 +11836,9 @@ def create_app(
                         **_agent_persona_kwargs(persona_id, stream_fn),
                     ):
                         data = event.to_dict()
-                        if turn_id:
+                        # Persist semantic events incrementally for recovery;
+                        # token deltas are live-only, replay uses final/thinking.
+                        if turn_id and event.type != "delta":
                             _append_chat_turn_agent_event(turn_id, data)
                         if event.type == "final":
                             final_reply = event.text
@@ -12499,8 +12589,11 @@ def create_app(
                 resolve_chat_persona(turn.payload.get("agent_persona")).id, stream_fn
             ),
         ):
-            events.append(event.to_dict())
-            _append_chat_turn_agent_event(turn.turn_id, event.to_dict())
+            # Same rule as the interactive endpoint: delta fragments are
+            # live-render only and never persisted into agent_events.
+            if event.type != "delta":
+                events.append(event.to_dict())
+                _append_chat_turn_agent_event(turn.turn_id, event.to_dict())
             if event.type == "final":
                 reply = event.text
         if not reply.strip():
@@ -19822,6 +19915,7 @@ def create_app(
                 orcarouter=_provider_out(_legacy_provider_projection("orcarouter")),
                 requesty=_provider_out(_legacy_provider_projection("requesty")),
                 api_route=_provider_out(_legacy_provider_projection("api_route")),
+                cheaperinference=_provider_out(_legacy_provider_projection("cheaperinference")),
                 embedding=EmbeddingConfigOut(
                     provider=cfg.llm.embedding.provider,
                     model=cfg.llm.embedding.model,
@@ -20773,6 +20867,7 @@ def create_app(
                 "openai_compatible",
                 "requesty",
                 "api_route",
+                "cheaperinference",
             }:
                 return "", None
             instance_id = normalized_type.replace("_", "-")
@@ -20852,6 +20947,7 @@ def create_app(
             "openai_compatible",
             "requesty",
             "api_route",
+            "cheaperinference",
         ):
             if provider_name in llm_data and isinstance(llm_data[provider_name], dict):
                 if bool(getattr(cfg.llm, "instance_routing", False)) and not native_payload:
@@ -21066,6 +21162,7 @@ def create_app(
             "openai_compatible",
             "requesty",
             "api_route",
+            "cheaperinference",
         }:
             return ConfigModelDiscoveryResponse(
                 ok=False,

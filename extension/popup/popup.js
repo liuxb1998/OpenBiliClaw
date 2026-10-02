@@ -6036,7 +6036,24 @@ async function popupDriveAgentStream(turn, { onUpdate, onDone } = {}) {
       session: turn.session || CHAT_SESSION,
       message: turn.message || "",
       onEvent(name, data) {
+        if (name === "delta") {
+          if (run.settled) return;
+          const step = Number(data?.step) || 1;
+          if (run.streamingStep !== step) run.streamingReply = "";
+          run.streamingStep = step;
+          run.streamingReply = (run.streamingReply || "") + String(data?.text || "");
+          onUpdate?.({ ...turn, session_id: sessionId, status: "processing" });
+          return;
+        }
+        if (name === "thinking") {
+          // Intermediate hop text belongs in the process flow, not the reply.
+          run.streamingReply = "";
+        }
         applyAgentEvent(run, name, data);
+        if (name === "final" || name === "done") run.streamingReply = run.finalText;
+        if (name === "thinking" || name === "final" || name === "done") {
+          onUpdate?.({ ...turn, session_id: sessionId, status: "processing" });
+        }
         updatePopupAgentRunDom(turn.turn_id);
         if (name === "approval_request") void refreshChatApprovals();
       },
@@ -6904,6 +6921,19 @@ function renderChatTurn(turn) {
     }
     return;
   }
+  // Keep live tokens on their own run so background history refreshes and
+  // switching away and back can restore an unfinished reply.
+  if (typeof agentRun?.streamingReply === "string") {
+    if (assistantPart instanceof HTMLElement) {
+      replaceChatThinkingPlaceholder(assistantPart, agentRun.streamingReply);
+    } else {
+      appendChatMessage("助手", agentRun.streamingReply, {
+        turnId: turn.turn_id,
+        part: "assistant",
+      });
+    }
+    return;
+  }
   if (!assistantPart) {
     appendChatThinkingPlaceholder(turn.turn_id);
   }
@@ -6983,13 +7013,17 @@ function applyTurnToMessage(turn) {
   };
 }
 
-function pollChatTurnUntilSettled(turnId, { onUpdate, onDone } = {}) {
+function pollChatTurnUntilSettled(turnId, { initialTurn = null, onUpdate, onDone } = {}) {
   if (!turnId || activeChatPolls.has(turnId)) return;
   const startedAt = Date.now();
+  let nextTurn = initialTurn?.turn_id === turnId ? initialTurn : null;
 
   async function tick() {
     try {
-      const turn = await fetchChatTurn(turnId);
+      // A GET can wake the durable fallback worker. Start from the turn the
+      // create/history request already returned so the live stream wins first.
+      const turn = nextTurn || await fetchChatTurn(turnId);
+      nextTurn = null;
       onUpdate?.(turn);
       if (turn.status === "completed" || turn.status === "failed") {
         activeChatPolls.delete(turnId);
@@ -7127,6 +7161,7 @@ async function hydrateChatHistory() {
         renderChatTurn(turn);
         if (isDialogueReplyTurn(turn) && (turn.status === "pending" || turn.status === "processing")) {
           pollChatTurnUntilSettled(turn.turn_id, {
+            initialTurn: turn,
             onUpdate: renderChatTurn,
             onDone: refreshAfterChatTurn,
           });
@@ -8807,7 +8842,12 @@ async function handlePendingConfirmationOpen(button) {
       },
     });
     if (turn?.turn_id) {
+      // The pending list can consume the whole message viewport in a compact
+      // popup. Once opened, give the card room so its actions are reachable.
+      state.pendingConfirmations.expanded = false;
+      renderPendingConfirmations();
       renderChatTurn(turn);
+      scrollChatMessagesToBottom();
       await selectDialogueContext(turn.turn_id);
     }
     await Promise.all([hydrateChatHistory(), refreshPendingConfirmations()]);
@@ -9066,7 +9106,7 @@ function bindChat() {
         skill,
       });
       if (sessionId !== popupChatSessionId) {
-        pollChatTurnUntilSettled(turn.turn_id, { onUpdate: renderChatTurn });
+        pollChatTurnUntilSettled(turn.turn_id, { initialTurn: turn, onUpdate: renderChatTurn });
         return;
       }
       clearSlowStatusTimer();
@@ -9076,6 +9116,7 @@ function bindChat() {
         await refreshAfterChatTurn();
       } else {
         pollChatTurnUntilSettled(turn.turn_id, {
+          initialTurn: turn,
           onUpdate: renderChatTurn,
           async onDone(doneTurn) {
             if (sessionId !== popupChatSessionId) return;
@@ -10007,6 +10048,7 @@ function bindSettings() {
     orcarouter: "OrcaRouter",
     requesty: "Requesty",
     api_route: "API Route",
+    cheaperinference: "Cheaper Inference",
     ollama: "Ollama",
     openai_compatible: "OpenAI-compatible",
   };
@@ -10019,6 +10061,7 @@ function bindSettings() {
     orcarouter: { model: "openai/gpt-4o", base_url: "https://api.orcarouter.ai/v1" },
     requesty: { model: "openai/gpt-4o-mini", base_url: "https://router.requesty.ai/v1" },
     api_route: { model: "gpt-5.5", base_url: "https://global.api-route.com/v1" },
+    cheaperinference: { model: "gpt-5.4-mini", base_url: "https://api.cheaperinference.com/v1" },
     ollama: { model: "qwen2.5:7b", base_url: "http://127.0.0.1:11434/v1" },
     openai_compatible: { model: "", base_url: "" },
   };
@@ -10029,6 +10072,7 @@ function bindSettings() {
     "orcarouter",
     "requesty",
     "api_route",
+    "cheaperinference",
     "ollama",
     "openai_compatible",
   ]);
@@ -10824,6 +10868,9 @@ function bindSettings() {
     setVal("cfgApiRouteKey", cfg.llm?.api_route?.api_key);
     setVal("cfgApiRouteModel", cfg.llm?.api_route?.model);
     setVal("cfgApiRouteBaseUrl", cfg.llm?.api_route?.base_url);
+    setVal("cfgCheaperinferenceKey", cfg.llm?.cheaperinference?.api_key);
+    setVal("cfgCheaperinferenceModel", cfg.llm?.cheaperinference?.model);
+    setVal("cfgCheaperinferenceBaseUrl", cfg.llm?.cheaperinference?.base_url);
     setVal("cfgOpenaiCompatibleKey", cfg.llm?.openai_compatible?.api_key);
     setVal("cfgOpenaiCompatibleModel", cfg.llm?.openai_compatible?.model);
     setVal("cfgOpenaiCompatibleBaseUrl", cfg.llm?.openai_compatible?.base_url);

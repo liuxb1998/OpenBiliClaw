@@ -239,6 +239,57 @@ def test_build_llm_registry_registers_api_route_instance() -> None:
     assert registry.get("api-route-main").base_url == "https://global.api-route.com/v1"
 
 
+def test_build_llm_registry_registers_cheaperinference() -> None:
+    config = Config(
+        llm=LLMConfig(
+            default_provider="cheaperinference",
+            cheaperinference=LLMProviderConfig(api_key="ci_live_test"),
+        )
+    )
+
+    registry = build_llm_registry(config)
+
+    assert registry.default_provider == "cheaperinference"
+    assert registry.get("cheaperinference").base_url == "https://api.cheaperinference.com/v1"
+    assert registry.get("cheaperinference")._model == "gpt-5.4-mini"
+
+
+def test_build_llm_registry_registers_cheaperinference_instance() -> None:
+    config = Config(
+        llm=LLMConfig(
+            instance_routing=True,
+            instances={
+                "cheaperinference-main": LLMInstanceConfig(
+                    name="Cheaper Inference",
+                    provider_type="cheaperinference",
+                    api_key="ci_live_test",
+                    model="gpt-5.4-mini",
+                )
+            },
+            default_chain=["cheaperinference-main"],
+        )
+    )
+
+    registry = build_llm_registry(config)
+
+    assert registry.default_provider == "cheaperinference-main"
+    assert registry.get("cheaperinference-main").name == "cheaperinference"
+    assert registry.get("cheaperinference-main").base_url == "https://api.cheaperinference.com/v1"
+
+
+def test_build_llm_registry_omits_cheaperinference_without_api_key() -> None:
+    config = Config(
+        llm=LLMConfig(
+            default_provider="deepseek",
+            deepseek=LLMProviderConfig(api_key="sk-deepseek", model="deepseek-v4-flash"),
+            cheaperinference=LLMProviderConfig(model="gpt-5.4-mini"),
+        )
+    )
+    registry = build_llm_registry(config)
+
+    assert "cheaperinference" not in registry.available_providers
+
+
 def test_build_llm_registry_omits_requesty_without_api_key() -> None:
     config = Config(
         llm=LLMConfig(

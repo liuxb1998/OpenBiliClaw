@@ -2875,6 +2875,7 @@ class TestBackendAPI:
                 database: object | None = None,
                 learning_mode: object,
                 settlement_queue: object | None = None,
+                link_ingestor: object | None = None,
             ) -> None:
                 self.llm = llm
                 self.soul_engine = soul_engine
@@ -2883,6 +2884,7 @@ class TestBackendAPI:
                 self.database = database
                 self.learning_mode = learning_mode
                 self.settlement_queue = settlement_queue
+                self.link_ingestor = link_ingestor
 
         fake_config = SimpleNamespace(
             data_path=Path("/tmp/openbiliclaw-test-data"),
@@ -3044,6 +3046,17 @@ class TestBackendAPI:
         assert runtime_context.llm_service.concurrency_gate is shared_gate
         assert captured["soul_engine_kwargs"]["llm_concurrency_gate"] is shared_gate
         assert shared_gate.status_payload()["llm_total_concurrency"] == 2
+        # Chat link ingestion (issue #83): the production dialogue carries a
+        # LinkIngestor bound to the runtime bilibili client and the durable
+        # memory event path.
+        from openbiliclaw.sources.link_ingest import LinkIngestor
+
+        dialogue = runtime_context.dialogue
+        assert isinstance(dialogue.link_ingestor, LinkIngestor)
+        assert dialogue.link_ingestor._bilibili_client is runtime_context.bilibili_client
+        # FakeMemoryManager 没有 propagate_event:装配必须防御性降级为 None,
+        # 而不是让上下文构建炸掉。生产 MemoryManager 一定带该方法。
+        assert dialogue.link_ingestor._event_sink is None
 
     def test_cap_by_franchise_keeps_at_most_n_per_franchise(self) -> None:
         """Regression for the 'one popup full of 原神' bug. The API

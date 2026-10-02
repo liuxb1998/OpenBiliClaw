@@ -215,10 +215,11 @@ After starting the backend, open `http://127.0.0.1:8420/web` (or just `http://12
 
 ## Recent Updates
 
-📌 Latest: **v0.3.224 (2026-09-19)**
+📌 Latest: **v0.3.225 (2026-10-01)**
 
-- **Custom AI reply tone (issues #255 / #65)**: `[soul] reply_style` appends a tone instruction (dialogue, recommendation copy and profile), while `dialogue_tone_prompt` replaces the chat tone block with your own words — persona, formal style, reply length, your call; defaults change nothing.
-- **Edit in settings and test in one click**: a new "Reply tone" section in the desktop web and extension settings pages, with a "Test tone" button that saves and instantly shows a real sample reply — no restart needed.
+- **Paste a link in chat and the AI gets it (issue #83)**: Bilibili / Zhihu / Xiaohongshu links (b23.tv short links auto-expanded) are fetched into the conversation and recorded as positive preference signals — fetch failures never block the chat.
+- **Token-by-token streaming replies**: chat replies now type out live on web and CLI, with true streaming for OpenAI-compatible providers and graceful fallback elsewhere.
+- **Multiline input in the CLI**: Enter sends, Esc+Enter inserts a newline; non-interactive terminals fall back to single-line input.
 
 Full changelog: [docs/changelog.md](docs/changelog.md).
 
@@ -749,7 +750,7 @@ OpenBiliClaw/
 |--------|-----------|
 | Backend | Python 3.11+ |
 | Browser Extension | TypeScript + Chrome Extension (Manifest V3) |
-| LLM | Multiple independent Base URL / token / model instances per provider type, with ordered global and per-module failover chains; first migration keeps a permanent legacy backup and `config-export-legacy` creates an old-version copy; built-in Gemini / DeepSeek / OpenAI / Claude / OpenRouter / OrcaRouter / Requesty / API Route / Ollama; any OpenAI-compatible endpoint works; OpenAI can experimentally reuse Codex CLI ChatGPT OAuth via the official Codex transport |
+| LLM | Multiple independent Base URL / token / model instances per provider type, with ordered global and per-module failover chains; first migration keeps a permanent legacy backup and `config-export-legacy` creates an old-version copy; built-in Gemini / DeepSeek / OpenAI / Claude / OpenRouter / OrcaRouter / Requesty / API Route / Cheaper Inference / Ollama; any OpenAI-compatible endpoint works; OpenAI can experimentally reuse Codex CLI ChatGPT OAuth via the official Codex transport |
 | Bilibili API | Custom client (WBI signing · v_voucher auto-recovery · rate control) |
 | Xiaohongshu | Extension DOM/state extraction + task dispatch; search/creator run in background tabs and search uses a MAIN-world page-response bridge when hidden virtual DOM is absent; only scrolling init opens `/explore` in the foreground and clicks the profile entry; no backend crawling |
 | Douyin | Extension DOM + MAIN-world passive fetch tap + task dispatch; init imports post / favorite / like / follow signals; search / hot / feed discovery starts from the Douyin home page and uses DOM interactions to trigger loading; search/feed passively collect page responses / rendered results, and hot can use a hot-board `group_id` seed as a logged-in related fallback; no backend login crawling |

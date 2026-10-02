@@ -8231,7 +8231,16 @@ ${cardFeedbackBarHtml()}`;
         data && typeof data === "object" && !Array.isArray(data)
           ? { ...data, type: data.type || name }
           : { type: name };
+      if (event.type === "delta") {
+        // Token 级增量：直接追加到实时回复气泡；thinking（中间跳）会清空它，
+        // final / done 用完整文本整体替换。过程模型不记录 delta，
+        // 避免历史回放重复拼接。
+        live.replyText = String(live.replyText || "") + String(data?.text || "");
+        renderChat({ forceBottom: true });
+        return;
+      }
       chatAgentCore.applyAgentEvent(live.process, event);
+      if (event.type === "thinking") live.replyText = "";
       if (event.type === "final") live.replyText = String(event.text || "");
       if (event.type === "error") live.finished = true;
       renderChat({ forceBottom: true });
@@ -10159,6 +10168,7 @@ ${cardFeedbackBarHtml()}`;
       orcarouter: "OrcaRouter",
       requesty: "Requesty",
     api_route: "API Route",
+      cheaperinference: "Cheaper Inference",
       ollama: "Ollama",
       openai_compatible: "OpenAI-compatible"
     };
@@ -10171,6 +10181,7 @@ ${cardFeedbackBarHtml()}`;
       orcarouter: { model: "openai/gpt-4o", base_url: "https://api.orcarouter.ai/v1" },
       requesty: { model: "openai/gpt-4o-mini", base_url: "https://router.requesty.ai/v1" },
     api_route: { model: "gpt-5.5", base_url: "https://global.api-route.com/v1" },
+      cheaperinference: { model: "gpt-5.4-mini", base_url: "https://api.cheaperinference.com/v1" },
       ollama: { model: "qwen2.5:7b", base_url: "http://127.0.0.1:11434/v1" },
       openai_compatible: { model: "", base_url: "" }
     };
@@ -10181,6 +10192,7 @@ ${cardFeedbackBarHtml()}`;
       "orcarouter",
       "requesty",
       "api_route",
+      "cheaperinference",
       "ollama",
       "openai_compatible"
     ]);

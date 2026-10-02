@@ -156,6 +156,11 @@ let agentLoopAvailable = true;
 const agentRunsByTurnId = new Map();
 const streamingTurnIds = new Set();
 const legacyStreamReplies = new Map();
+// Live token deltas of the current agent-stream hop, keyed by turn_id.
+// Deltas render into the turn's thinking bubble as they arrive; a
+// ``thinking`` event (intermediate hop done) resets the buffer, and the
+// authoritative ``final`` / ``done`` text replaces it.
+const agentDeltaBuffers = new Map();
 
 const CHAT_SESSION_STORAGE_KEY = "openbiliclaw.mobile.chatSessionId";
 const CHAT_SESSION_SKILLS_STORAGE_KEY = "openbiliclaw.mobile.chatSessionSkills";
@@ -1571,6 +1576,7 @@ async function driveAgentStream(turnId, message, sourceTurn = null) {
   if (sessionId === activeSessionId) sending = true;
   run.sessionId = sessionId;
   agentRunsByTurnId.set(turnId, run);
+  agentDeltaBuffers.set(turnId, "");
   try {
     const done = await streamAgentChatTurn({
       turnId,
@@ -1579,6 +1585,20 @@ async function driveAgentStream(turnId, message, sourceTurn = null) {
       session: "popup",
       message,
       onEvent(name, data) {
+        if (name === "delta") {
+          // Token-level reply streaming: render fragments into the live
+          // bubble immediately; ``final``/``done`` replace it wholesale.
+          const next = (agentDeltaBuffers.get(turnId) || "") + String(data?.text || "");
+          agentDeltaBuffers.set(turnId, next);
+          updateLegacyReplyDom(turnId, next);
+          return;
+        }
+        if (name === "thinking") {
+          // The streamed hop text was intermediate reasoning, not the
+          // reply: it moves into the process flow; reset the live bubble.
+          agentDeltaBuffers.set(turnId, "");
+          updateLegacyReplyDom(turnId, "");
+        }
         applyAgentEvent(run, name, data);
         updateAgentRunDom(turnId);
         if (name === "approval_request") void refreshApprovals().then(render);
@@ -1588,9 +1608,10 @@ async function driveAgentStream(turnId, message, sourceTurn = null) {
   } catch (error) {
     if (Number(error?.status) === 503) {
       // loop_enabled=false: permanent for this page load; fall back to the
-      // legacy single-hop fake stream so the pending turn still completes.
+      // legacy single-hop stream so the pending turn still completes.
       agentLoopAvailable = false;
       agentRunsByTurnId.delete(turnId);
+      agentDeltaBuffers.delete(turnId);
       await driveLegacyStream(turnId, message);
       return;
     }
@@ -1601,6 +1622,8 @@ async function driveAgentStream(turnId, message, sourceTurn = null) {
     if (sessionId !== activeSessionId) return;
     setDialogueStatus(messageText, "error");
     render();
+  } finally {
+    agentDeltaBuffers.delete(turnId);
   }
 }
 

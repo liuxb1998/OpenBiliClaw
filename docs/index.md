@@ -37,6 +37,7 @@
 - [聊天真实请求复验（9月28日）](testing/2026-09-28-chat-real-request-recheck.md) — 19 次真实模型请求、三端 UI、延迟样本与仍存在的限制
 - [聊天完整复查（9月30日）](testing/2026-09-30-chat-comprehensive-e2e.md) — 最新 main 合并验收、三端草稿修复、审批冲突/任务恢复、真实限流与功能流程优化优先级
 - [聊天三端逐项复验（9月30日）](testing/2026-09-30-chat-three-surfaces-e2e.md) — 插件/Web/移动端真实操作矩阵、4 项修复、限流与外网失败边界
+- [聊天最新链路真实请求复验](testing/2026-10-02-chat-live-recheck.md) — 最新 main 整合、插件逐字与卡片布局修复、旧路径并发幂等
 - [假设与疑惑 Luna 实测](testing/2026-10-01-chat-cards-codex-luna.md) — 三端卡片、真实 CLI 回复、疑惑数据库结算与提示遮挡修复
 - [聊天风格模板验收](testing/2026-09-26-chat-personas.md) — 六种会话风格、三端真实请求与跨设备保存、移动布局和验证边界
 - [手动端到端联调](manual-e2e.md) — CLI、插件与 SQLite 的真实联调步骤

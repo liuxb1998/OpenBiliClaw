@@ -518,7 +518,7 @@ export async function streamAgentChatTurn({
   return donePayload;
 }
 
-/** Legacy fake-streaming fallback (POST /api/chat/stream) for loop_enabled=false. */
+/** Legacy single-hop streaming fallback (POST /api/chat/stream) for loop_enabled=false. */
 export async function streamChatTurnLegacy({
   turnId = "",
   session = "popup",

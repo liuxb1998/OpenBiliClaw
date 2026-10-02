@@ -235,10 +235,11 @@
 
 ## 最近更新
 
-📌 最新版本：**v0.3.224（2026-09-19）**
+📌 最新版本：**v0.3.225（2026-10-01）**
 
-- **自定义 AI 回复语气（issue #255 / #65）**：`[soul] reply_style` 追加一条语气要求（对话 / 推荐文案 / 画像都生效），`dialogue_tone_prompt` 用你自己的文字整体替换聊天语气——人设、正式书面化、回复长度随你定，默认不改任何现有行为。
-- **设置页直接编辑 + 一键测试**：桌面 Web 与插件设置页新增「回复语气」区块，点「测试语气」保存后立即看到一句真实回复的效果，无需重启。
+- **聊天里贴链接，AI 就能看懂并记住你的口味（issue #83）**：粘贴 B站/知乎/小红书链接（b23.tv 等短链自动展开），内容注入当轮对话并记为正向偏好，抓取失败也不卡聊天。
+- **回复逐字流式输出**：Web 端与 CLI 聊天回复像打字一样逐字出现，OpenAI 兼容模型真流式，其余 provider 自动回退。
+- **CLI 聊天支持多行输入**：Enter 发送、Esc+Enter 换行，非交互终端自动回退单行输入。
 
 完整变更详见 [docs/changelog.md](docs/changelog.md)。
 
@@ -758,7 +759,7 @@ OpenBiliClaw/
 |------|------|
 | 后端 | Python 3.11+ |
 | 浏览器插件 | TypeScript + Chrome Extension (Manifest V3) |
-| LLM | 同一 Provider 类型可建多个独立 Base URL / token / model 实例，并配置全局及模块有序降级链；首次迁移自动保留旧配置备份，`config-export-legacy` 可生成旧版副本；内置 Gemini / DeepSeek / OpenAI / Claude / OpenRouter / OrcaRouter / Requesty / API Route / Ollama，兼容任意 OpenAI 协议服务；OpenAI 可实验性复用 Codex CLI ChatGPT OAuth（官方 Codex 传输） |
+| LLM | 同一 Provider 类型可建多个独立 Base URL / token / model 实例，并配置全局及模块有序降级链；首次迁移自动保留旧配置备份，`config-export-legacy` 可生成旧版副本；内置 Gemini / DeepSeek / OpenAI / Claude / OpenRouter / OrcaRouter / Requesty / API Route / Cheaper Inference / Ollama，兼容任意 OpenAI 协议服务；OpenAI 可实验性复用 Codex CLI ChatGPT OAuth（官方 Codex 传输） |
 | B 站交互 | 自研 API 客户端 (WBI 签名 · v_voucher 自动恢复 · 速率控制) |
 | 小红书交互 | 扩展 DOM/state 元数据提取 + 插件任务调度；search / creator 在后台标签执行，search 用 MAIN-world 页面响应桥避开隐藏页虚拟 DOM 限制；仅滚动型初始化会前台打开 `/explore` 并点击页面 profile 入口（零后端爬取） |
 | 抖音交互 | 扩展 DOM + MAIN-world 被动 fetch tap + 插件任务调度；初始化导入发布 / 收藏 / 点赞 / 关注信号，search / hot / feed discovery 从抖音首页模拟 DOM 操作触发加载，search/feed 被动收集页面响应 / 渲染结果，hot 可用热榜 `group_id` seed 走已登录页面 related fallback（零后端代登录） |

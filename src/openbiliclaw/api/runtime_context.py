@@ -1938,6 +1938,15 @@ class RuntimeContext:
         )
         if callable(bind_settlement_queue):
             bind_settlement_queue(new_settlement_queue)
+        # Chat link ingestion (issue #83): shared links are fetched for
+        # context and recorded as share events on the unified interest line.
+        from openbiliclaw.sources.link_ingest import LinkIngestor
+
+        propagate_event = getattr(self.memory_manager, "propagate_event", None)
+        new_link_ingestor = LinkIngestor(
+            bilibili_client=new_bilibili_client,
+            event_sink=propagate_event if callable(propagate_event) else None,
+        )
         new_dialogue = SocraticDialogue(
             llm=None,
             soul_engine=new_soul_engine,
@@ -1948,6 +1957,7 @@ class RuntimeContext:
             database=self.database,
             learning_mode=DialogueLearningMode.QUEUED,
             settlement_queue=new_settlement_queue,
+            link_ingestor=new_link_ingestor,
         )
 
         # Multi-hop chat agent loop (「聊一聊」 M2): same LLM service and

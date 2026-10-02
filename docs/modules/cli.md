@@ -96,7 +96,7 @@ openbiliclaw [--log-level DEBUG|INFO|WARNING|ERROR] <命令>
 | `discover-v2ex-hot` | 只读验证 V2EX 热门 Topic | ✅ |
 | `discover-v2ex-latest` | 只读验证 V2EX 最新 Topic | ✅ |
 | `search-douyin` | 通过浏览器插件调试抖音搜索召回 | ✅ |
-| `chat` | 苏格拉底式对话 | ✅ |
+| `chat` | 苏格拉底式对话；消息里粘贴的 B站/知乎/小红书等链接（含 b23.tv / xhslink.com 短链）会先被抓取摘要注入当轮上下文，并记为 `share` 正向偏好事件（issue #83，抓取失败静默降级不阻塞对话） | ✅ |
 | `ledger` | 查看画像更新台账（`--line` 逐行 / `--days` / `--write-point` 过滤） | ✅ |
 | `delight` | 手动查看当前惊喜推荐候选 | ✅ |
 | `probe` | 手动查看并确认猜测兴趣方向 | ✅ |
@@ -898,6 +898,7 @@ OpenBiliClaw 需要一个语言模型来理解你的兴趣、写推荐文案。
  7   OrcaRouter 聚合                       默认 openai/gpt-4o。一个 Key 跑 150+ 模型,网关级零信任安全
  8   Requesty 聚合                         默认 openai/gpt-4o-mini。一个 Key 跑多家模型,按调用计费
  9   API Route 聚合                        默认 gpt-5.5。一个 Key 跑多家模型,按调用计费
+10   Cheaper Inference 聚合                默认 gpt-5.4-mini。一个 Key 跑多家模型,按调用计费
 
 Tip:不确定就选 1 (DeepSeek),¥0.001/千 token 几乎免费,月度通常 ¥0.5-2。已经买了中转站 / OneAPI Key 选 2 (协议兼容)。本地 Ollama 仅用于向量检索(embedding),不作为聊天服务商;如需本地聊天模型请到设置页手动配置。
 
@@ -1567,12 +1568,17 @@ openbiliclaw init
 
 ### `openbiliclaw chat`
 
-进入持续对话模式，复用 `SocraticDialogue` 的多轮历史。CLI 构造点显式固定为
+进入持续对话模式，复用 `SocraticDialogue` 的多轮历史。回复经 `respond_stream()` 逐 token
+流式打印（`阿花：` 前缀只出一次，增量不解析 markup、不换行刷屏）；service 无流式能力时
+回退一次性输出。CLI 构造点显式固定为
 `legacy_direct`：得到回复后仍按既有 detached direct learning 学习，既不提交 API
 runtime 的 `DialogueSettlementQueue`，也不持有 worker guard permit；因此行为不变，
 但不享受队列串行/receipt/guard 保证。Wave 3 的 HTTP `202 processing` 与 30 秒
 卡片轮询只服务 popup、移动 Web 与桌面 Web 卡片，CLI 没有 action HTTP 入口，不新增 poll。输入
-`exit`、`quit` 或空行可结束。聊天内容
+`exit`、`quit` 或空行可结束。交互式终端下（stdin/stdout 均为 TTY）输入框由
+prompt_toolkit 驱动，支持多行输入：Enter 发送，Esc+Enter（或 Alt+Enter）插入换行，
+进入对话时副标题会提示该快捷键；管道、重定向等非 TTY 环境自动回退为原来的单行
+`typer.prompt` 读取，行为与此前完全一致。聊天内容
 仅在得到真实回复后以受控方式积累到长期理解候选中，不会因为一句话立刻改写画像。
 单轮 LLM 失败会打印安全、可操作的错因（不显示上游异常原文），REPL 继续接受下一轮输入。
 

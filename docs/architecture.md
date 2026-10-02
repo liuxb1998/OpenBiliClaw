@@ -325,6 +325,7 @@ Web durable turn 只在成功 completion CAS 后交接认知与成功事件；�
 ### Sources (`sources/`) — 多源适配层 (v0.3.0+)
 - `SourceAdapter` Protocol：每个内容源实现统一接口
 - `platforms.py` — Bilibili / 小红书 / 抖音 / YouTube / X / 知乎 / Reddit / Linux.do / Bangumi / V2EX / 微博 / GitHub 十二个平台族的唯一可枚举注册表；Storage pool accounting、事件 identity、URL host 推断、已看过滤和 runtime 常量都委托该表，避免跨模块别名漂移
+- `link_ingest.py` — 对话内链接摄入（issue #83）：聊天消息里的 URL 提取、b23.tv / xhslink.com 短链展开、按平台抓内容摘要（B站复用 `BilibiliAPIClient` /view，其余抓 og 元数据），渲染当轮 prompt 上下文块并把抓取成功的链接记为 `share` 偏好事件；被 `SocraticDialogue` 在 Web 与 CLI 聊天入口前调用，抓取失败永远降级不阻塞聊天
 - `weibo_tasks.py` — 微博 init-only 浏览器任务队列、账号绑定、scope 去重与收藏 / 关注 / mentions 到画像事件的转换；扩展只回传规范化、无 Cookie 的结果
 - `bilibili_adapter` — B 站 API 直连（WBI 签名、v_voucher 自动恢复）；主 search 在既有预算内提供 1×5 的 `pubdate` 近期 lane。`bili_tasks` + `/api/sources/bili/*` 提供搜索冷却时的扩展 DOM 搜索兜底，并复用同一有界近期 lane；回传结果进入 `discovery_candidates`
 - `xiaohongshu_adapter` — 小红书扩展代理（被动收集 + 关键词搜索 + 创作者订阅 + `bootstrap_profile` 初始化画像任务，零后端爬取；task-result 进入 memory 前按已见 note key 跨任务去重）。search / creator 均在 inactive tab 执行；search 通过 MAIN-world bridge 只归一化页面自身 search API 的公开卡片字段，经同页 replay 缓存送入 isolated executor，DOM 作为 schema 漂移兜底，因此隐藏页不挂载虚拟列表也不会抢占用户当前页面；只有需要点击本人入口和受控滚动的 bootstrap 保持前台。legacy task claim 受动态来源开关、全局 scheduler、持久化抖动间隔和平台冷却四层门控；`xhs_task_runtime_state.rate_limit_strikes` 让独立风控轮次按 1/2/4…小时退避（24 小时封顶），同一活动冷却内不重复加 strike，冷却后的正常自动任务成功才重置。扩展 `risk-control.ts` 只上报结构化安全验证 / 操作频繁 / 429 结果，不上传页面全文。强信号赞 / 收藏由 MAIN-world `xhs-action-tap`（`obc-xhs-action`，与 token sniffer 隔离）在 like/dislike/collect/uncollect 写端点业务成功后网络层认定，adapter 声明 `tapAuthoritativeActions:{like,favorite,retraction}` 让 kernel 抑制对应 DOM 发射，事件 URL 拼 `…/explore/<note_id>` 与后端 `sources/identity_keys` note 键型互通（支持赞→撤销折价）
@@ -504,7 +505,7 @@ flowchart LR
 微博的个人 bootstrap 采用同一类隔离任务边界，但不是普通行为采集：`weibo_tasks` → `/api/sources/weibo/next-task` → 带 `openbiliclaw_weibo_task=1` 的 `m.weibo.cn` tab → 同源 `/api/config` / `/api/account/getuid` 与收藏、关注、mentions GET → `/api/sources/weibo/task-result`。`SUBP + ALF` 只在扩展本地作为登录布尔提示，游客 `SUB` 不算凭据；任务结果必须带正 uid，后端按账号与 scope 去重后才进入 profile event ingress。失败/登录墙/挑战页/部分 scope 不会伪装成 healthy empty，已采 rows 仍留在 staged result 中。
 
 ### LLM Providers (`llm/`)
-- 统一的多模型接口（OpenAI / Claude / Gemini / DeepSeek / Ollama / OpenRouter / OrcaRouter / Requesty / API Route）
+- 统一的多模型接口（OpenAI / Claude / Gemini / DeepSeek / Ollama / OpenRouter / OrcaRouter / Requesty / API Route / Cheaper Inference）
 - `[llm.instances.<id>]` 为每个端点保存独立 `provider_type` / Base URL / token / model；registry 以实例 ID 注册，同一个 adapter 可实例化多次。`default_chain` 可包含任意数量实例，失败与限流 cooldown 都只影响当前实例
 - `LLMService` 通过 caller bucket 选择 `[llm.routes.soul/discovery/recommendation/evaluation]`：默认继承全局链，`inherit=false` 时执行模块自己的完整链并严格禁止 spill 到全局链。旧 provider/model override 会投影为等价实例或派生实例
 - `LLMRegistry.complete_chain()` 执行有序链，`complete_provider()` 精确探测一个实例；响应携带最终 `instance_id`。Ollama chat 实例必须显式配置 model，仅有服务地址或独立 `bge-m3` embedding 不会注册 chat、更不会猜 `llama3`

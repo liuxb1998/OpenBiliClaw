@@ -8,6 +8,7 @@ from __future__ import annotations
 import asyncio
 import json
 import logging
+from types import SimpleNamespace
 from typing import TYPE_CHECKING, Any
 from urllib.parse import urlparse
 
@@ -22,6 +23,7 @@ from .base import (
     LLMRateLimitError,
     LLMResponse,
     LLMResponseError,
+    LLMStreamChunk,
     LLMTimeoutError,
     LLMToolCallUnsupportedError,
 )
@@ -41,7 +43,7 @@ _BILLING_BACKOFF_MARKERS = (
 )
 
 if TYPE_CHECKING:
-    from collections.abc import Awaitable, Callable
+    from collections.abc import AsyncIterator, Awaitable, Callable
 
 # A reasoning-first endpoint can burn the entire output budget on invisible
 # thinking and finish truncated — ``finish_reason=length`` on chat
@@ -365,6 +367,229 @@ class OpenAIProvider(LLMProvider):
             usage=self._chat_usage(response),
             raw=response,
             tool_calls=tool_calls or None,
+        )
+
+    def _chat_completion_kwargs(
+        self,
+        messages: list[dict[str, Any]],
+        *,
+        temperature: float,
+        max_tokens: int,
+        model: str | None,
+        reasoning_effort: str | None,
+    ) -> dict[str, Any]:
+        """Assemble the shared chat-completions request kwargs."""
+        effective_model = (model or "").strip() or self._model
+        effective_reasoning_effort = self._effective_reasoning_effort(reasoning_effort)
+        kwargs: dict[str, Any] = {
+            "model": effective_model,
+            "messages": messages,
+            "temperature": temperature,
+            "max_tokens": max_tokens,
+        }
+        extra_headers = self._extra_headers()
+        if extra_headers:
+            kwargs["extra_headers"] = extra_headers
+        openai_effort = self._openai_reasoning_effort(
+            effective_model,
+            effective_reasoning_effort,
+        )
+        if openai_effort is not None:
+            kwargs["reasoning_effort"] = openai_effort
+        extra_body = self._extra_body(reasoning_effort=effective_reasoning_effort)
+        if extra_body:
+            kwargs["extra_body"] = extra_body
+        return kwargs
+
+    async def _chat_stream_request(self, **kwargs: Any) -> Any:
+        """Open a streaming chat request, adapting to backend quirks.
+
+        Reuses the temperature-compat retry of the one-shot path; older
+        gateways that reject ``stream_options`` get one retry without it
+        (usage accounting is then simply absent for that stream).
+        """
+        try:
+            return await self._chat_request_with_temperature_compat(**kwargs)
+        except LLMProviderError as exc:
+            if "stream_options" in kwargs and "stream_options" in str(exc).lower():
+                logger.info(
+                    "%s rejected stream_options; retrying the stream without it",
+                    self._provider_name,
+                )
+                kwargs.pop("stream_options")
+                return await self._chat_request_with_temperature_compat(**kwargs)
+            raise
+
+    async def stream_complete(
+        self,
+        messages: list[dict[str, str]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        json_mode: bool = False,
+        reasoning_effort: str | None = None,
+        model: str | None = None,
+    ) -> AsyncIterator[LLMStreamChunk]:
+        """Stream a chat completion token by token (chat-completions flavor).
+
+        The Responses-API flavor and ``json_mode`` deliberately keep the
+        base class's one-shot fallback over ``complete()``: structured
+        callers depend on the json-format rejection retries, and the
+        Responses flavor's streaming events are not wired here. Unlike
+        ``complete()``, the streaming path does not reissue truncated or
+        empty requests with a larger budget — mid-stream retries would
+        duplicate already-displayed text; the registry's pre-delta fallback
+        still covers failures before the first token.
+        """
+        if self._api_flavor == "responses" or json_mode:
+            async for chunk in super().stream_complete(
+                messages,
+                temperature=temperature,
+                max_tokens=max_tokens,
+                json_mode=json_mode,
+                reasoning_effort=reasoning_effort,
+                model=model,
+            ):
+                yield chunk
+            return
+        kwargs = self._chat_completion_kwargs(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
+        kwargs["stream"] = True
+        kwargs["stream_options"] = {"include_usage": True}
+        stream = await self._chat_stream_request(**kwargs)
+        parts: list[str] = []
+        model_seen = ""
+        usage: dict[str, int] | None = None
+        try:
+            async for event in stream:
+                model_seen = str(getattr(event, "model", "") or model_seen)
+                if getattr(event, "usage", None):
+                    usage = self._chat_usage(event)
+                choices = getattr(event, "choices", None) or []
+                if not choices:
+                    continue
+                delta = getattr(choices[0], "delta", None)
+                content = str(getattr(delta, "content", "") or "")
+                if content:
+                    parts.append(content)
+                    yield LLMStreamChunk(delta=content)
+        except Exception as exc:
+            raise self._map_error(exc) from exc
+        content = "".join(parts)
+        if not content.strip():
+            raise LLMResponseError(f"{self._provider_name} returned an empty streamed response")
+        yield LLMStreamChunk(
+            response=LLMResponse(
+                content=content,
+                model=model_seen,
+                provider=self._provider_name,
+                usage=usage,
+            )
+        )
+
+    async def stream_complete_with_tools(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
+        model: str | None = None,
+    ) -> AsyncIterator[LLMStreamChunk]:
+        """Stream a chat completion with native function calling.
+
+        Content deltas flow live; ``tool_calls`` deltas are accumulated
+        silently and surface only on the terminal chunk's response, so the
+        agent loop can decide per hop whether the streamed text was the
+        final reply or intermediate reasoning.
+        """
+        if self._api_flavor == "responses":
+            raise LLMToolCallUnsupportedError(
+                f"{self._provider_name} (api_flavor=responses) has no native tool calling."
+            )
+        kwargs = self._chat_completion_kwargs(
+            messages,
+            temperature=temperature,
+            max_tokens=max_tokens,
+            model=model,
+            reasoning_effort=reasoning_effort,
+        )
+        if tools:
+            kwargs["tools"] = tools
+            kwargs["tool_choice"] = "auto"
+        kwargs["stream"] = True
+        kwargs["stream_options"] = {"include_usage": True}
+        stream = await self._chat_stream_request(**kwargs)
+        parts: list[str] = []
+        pending_calls: dict[int, dict[str, Any]] = {}
+        model_seen = ""
+        usage: dict[str, int] | None = None
+        try:
+            async for event in stream:
+                model_seen = str(getattr(event, "model", "") or model_seen)
+                if getattr(event, "usage", None):
+                    usage = self._chat_usage(event)
+                choices = getattr(event, "choices", None) or []
+                if not choices:
+                    continue
+                delta = getattr(choices[0], "delta", None)
+                if delta is None:
+                    continue
+                content = str(getattr(delta, "content", "") or "")
+                if content:
+                    parts.append(content)
+                    yield LLMStreamChunk(delta=content)
+                for raw_call in getattr(delta, "tool_calls", None) or []:
+                    index = int(getattr(raw_call, "index", 0) or 0)
+                    entry = pending_calls.setdefault(
+                        index, {"id": "", "name": "", "arguments_parts": []}
+                    )
+                    call_id = getattr(raw_call, "id", None)
+                    if call_id:
+                        entry["id"] = str(call_id)
+                    function = getattr(raw_call, "function", None)
+                    if function is not None:
+                        name = getattr(function, "name", None)
+                        if name:
+                            entry["name"] += str(name)
+                        arguments = getattr(function, "arguments", None)
+                        if arguments:
+                            entry["arguments_parts"].append(str(arguments))
+        except Exception as exc:
+            raise self._map_error(exc) from exc
+        content = "".join(parts)
+        normalized_message = SimpleNamespace(
+            tool_calls=[
+                {
+                    "id": entry["id"],
+                    "function": {
+                        "name": entry["name"],
+                        "arguments": "".join(entry["arguments_parts"]),
+                    },
+                }
+                for _index, entry in sorted(pending_calls.items())
+            ]
+        )
+        tool_calls = self._parse_native_tool_calls(normalized_message)
+        if not content.strip() and not tool_calls:
+            raise LLMResponseError(
+                f"{self._provider_name} returned an empty streamed response "
+                "(no content, no tool calls)"
+            )
+        yield LLMStreamChunk(
+            response=LLMResponse(
+                content=content,
+                model=model_seen,
+                provider=self._provider_name,
+                usage=usage,
+                tool_calls=tool_calls or None,
+            )
         )
 
     @staticmethod

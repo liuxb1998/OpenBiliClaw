@@ -11,12 +11,20 @@ import hashlib
 import logging
 import re
 import time
+from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, ClassVar, Literal, cast
 from urllib.parse import quote, urlencode, urlparse
 from xml.etree import ElementTree
 
 import httpx
+
+from openbiliclaw.bilibili.search_backoff import (
+    mark_search_recovery_probe,
+    persist_shared_backoff,
+    read_shared_backoff,
+    snapshot_from_monotonic,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -229,6 +237,21 @@ class BilibiliAPIClient:
     _search_cooldown_level: ClassVar[int] = 0
     _search_voucher_block_streak: ClassVar[int] = 0
     _search_dom_fallback_until: ClassVar[float] = 0.0
+    # Recovery-probe bookkeeping: a lifted block is discovered by one probe
+    # request halfway through the cooldown window instead of idling the full
+    # (up to 1800s) cooldown out. Wall/mono anchors for the active window and
+    # whether this process already spent the in-memory fallback probe.
+    _search_cooldown_activated_mono: ClassVar[float] = 0.0
+    _search_cooldown_activated_wall: ClassVar[float] = 0.0
+    _search_cooldown_probe_used: ClassVar[bool] = False
+    # Process-wide LRU for /view payloads: one discovery round resolves the
+    # same bvid through get_video_info() (scoring), _resolve_aid() (save
+    # writes), cid lookup (danmaku/subtitle/play) and the API layer, each of
+    # which used to re-issue the request. The key carries a SESSDATA
+    # fingerprint because anonymous and authenticated responses can differ.
+    _VIEW_DATA_CACHE_TTL_SECONDS: ClassVar[float] = 600.0
+    _VIEW_DATA_CACHE_MAX_ENTRIES: ClassVar[int] = 512
+    _view_data_cache: ClassVar[OrderedDict[str, tuple[float, dict[str, Any]]]] = OrderedDict()
     _WBI_MIXIN_KEY_ENC_TAB = [
         46,
         47,
@@ -344,13 +367,115 @@ class BilibiliAPIClient:
         self._last_request_at = time.monotonic()
 
     @classmethod
+    def _merge_shared_backoff(cls) -> None:
+        """Adopt any stricter backoff another process persisted to disk.
+
+        The CLI runs API server + worker + discovery worker as separate
+        processes, each with its own copy of the ClassVars below; the shared
+        state file lets a 412 hard cooldown (or a v_voucher soft cooldown) in
+        one process back off all of them. On-disk deadlines are wall-clock
+        epochs (``time.monotonic()`` is not comparable across processes) and
+        merge with ``max`` so the most conservative process wins; the
+        escalation counters only merge while they still belong to a live
+        incident. Any I/O failure leaves the in-process state untouched.
+        """
+        shared = read_shared_backoff()
+        if shared is None:
+            return
+        now_wall = time.time()
+        now_monotonic = time.monotonic()
+        cooldown_remaining = shared.cooldown_until - now_wall
+        if cooldown_remaining > cls._search_cooldown_until - now_monotonic:
+            cls._search_cooldown_until = now_monotonic + cooldown_remaining
+        fallback_remaining = shared.dom_fallback_until - now_wall
+        if fallback_remaining > cls._search_dom_fallback_until - now_monotonic:
+            cls._search_dom_fallback_until = now_monotonic + fallback_remaining
+        if shared.counters_fresh(now_wall):
+            cls._search_cooldown_level = max(cls._search_cooldown_level, shared.cooldown_level)
+            cls._search_voucher_block_streak = max(
+                cls._search_voucher_block_streak,
+                shared.voucher_block_streak,
+            )
+        cls._search_cooldown_activated_wall = max(
+            cls._search_cooldown_activated_wall,
+            shared.activated_at,
+        )
+
+    @classmethod
+    def _persist_search_backoff(cls, *, reset_counters: bool = False) -> None:
+        """Mirror the in-process backoff state to the shared state file."""
+        persist_shared_backoff(
+            snapshot_from_monotonic(
+                cooldown_until=cls._search_cooldown_until,
+                cooldown_level=cls._search_cooldown_level,
+                voucher_block_streak=cls._search_voucher_block_streak,
+                dom_fallback_until=cls._search_dom_fallback_until,
+                activated_at=cls._search_cooldown_activated_wall,
+            ),
+            reset_counters=reset_counters,
+        )
+
+    @classmethod
+    def _consume_search_recovery_probe(cls) -> bool:
+        """Allow exactly one probe request halfway through an active cooldown.
+
+        A 412 / v_voucher cooldown can outlast the actual block (up to the
+        1800s ceiling); probing once at the window's midpoint discovers a
+        lifted block in about half the time while costing at most one request
+        per window. The probe budget is shared across processes through the
+        state file; with persistence disabled it falls back to one probe per
+        process per window.
+        """
+        shared = read_shared_backoff()
+        if shared is not None:
+            due = shared.probe_due_at()
+            if due <= 0.0:
+                return False
+            now = time.time()
+            if now < due or shared.last_probe_at >= due:
+                return False
+            mark_search_recovery_probe(now)
+            return True
+        if cls._search_cooldown_probe_used or cls._search_cooldown_activated_mono <= 0.0:
+            return False
+        window = cls._search_cooldown_until - cls._search_cooldown_activated_mono
+        if window <= 0.0:
+            return False
+        if time.monotonic() < cls._search_cooldown_activated_mono + window / 2:
+            return False
+        cls._search_cooldown_probe_used = True
+        return True
+
+    @classmethod
+    def _clear_search_cooldown_after_probe(cls) -> None:
+        """Clear the whole cooldown once a recovery probe proved search healthy."""
+        cls._search_cooldown_until = 0.0
+        cls._search_dom_fallback_until = 0.0
+        cls._search_cooldown_level = 0
+        cls._search_voucher_block_streak = 0
+        cls._search_cooldown_activated_mono = 0.0
+        cls._search_cooldown_activated_wall = 0.0
+        cls._search_cooldown_probe_used = False
+        persist_shared_backoff(
+            snapshot_from_monotonic(
+                cooldown_until=0.0,
+                cooldown_level=0,
+                voucher_block_streak=0,
+                dom_fallback_until=0.0,
+            ),
+            clear=True,
+        )
+
+    @classmethod
     def search_cooldown_remaining(cls) -> float:
-        """Seconds remaining in the process-wide Bilibili search cooldown."""
+        """Seconds remaining in the shared Bilibili search cooldown."""
+        cls._merge_shared_backoff()
         return max(0.0, cls._search_cooldown_until - time.monotonic())
 
     @classmethod
     def search_dom_fallback_remaining(cls) -> float:
         """Seconds remaining while rendered-page search fallback is preferred."""
+        cls._merge_shared_backoff()
         return max(0.0, cls._search_dom_fallback_until - time.monotonic())
 
     @classmethod
@@ -361,11 +486,13 @@ class BilibiliAPIClient:
         search may keep probing, but the browser extension can backfill via a
         rendered search page while the API path looks degraded.
         """
+        cls._merge_shared_backoff()
         duration = cls._SEARCH_DOM_FALLBACK_SECONDS if seconds is None else seconds
         cls._search_dom_fallback_until = max(
             cls._search_dom_fallback_until,
             time.monotonic() + duration,
         )
+        cls._persist_search_backoff()
         return duration
 
     @classmethod
@@ -376,6 +503,7 @@ class BilibiliAPIClient:
         longer hard-cooldown base); the escalation multiplier and absolute
         ceiling are shared across both causes.
         """
+        cls._merge_shared_backoff()
         cls._search_cooldown_level = min(cls._search_cooldown_level + 1, 3)
         base = cls._SEARCH_COOLDOWN_BASE_SECONDS if base_seconds is None else base_seconds
         duration = min(
@@ -386,6 +514,11 @@ class BilibiliAPIClient:
             cls._search_cooldown_until,
             time.monotonic() + duration,
         )
+        cls._search_cooldown_activated_mono = time.monotonic()
+        cls._search_cooldown_activated_wall = time.time()
+        cls._search_cooldown_probe_used = False
+        # Persists the whole snapshot (cooldown deadline included) via the
+        # dom-fallback activation below.
         cls._activate_search_dom_fallback(seconds=duration)
         return duration
 
@@ -400,7 +533,9 @@ class BilibiliAPIClient:
         not an IP-level block, and must not strand the search round +
         explore for the full cooldown.
         """
+        cls._merge_shared_backoff()
         cls._search_voucher_block_streak += 1
+        cls._persist_search_backoff()
         if cls._search_voucher_block_streak >= cls._SEARCH_VOUCHER_BLOCK_THRESHOLD:
             return cls._activate_search_cooldown()
         return 0.0
@@ -410,6 +545,7 @@ class BilibiliAPIClient:
         """Reset escalation + the v_voucher streak once search succeeds again."""
         cls._search_cooldown_level = 0
         cls._search_voucher_block_streak = 0
+        cls._persist_search_backoff(reset_counters=True)
 
     @staticmethod
     def _sanitized_http_error(
@@ -583,6 +719,31 @@ class BilibiliAPIClient:
             mid=int(data.get("mid", 0)),
         )
 
+    def _view_cache_key(self, bvid: str) -> str:
+        """Cache key scoped by login identity: anon and authed /view payloads differ."""
+        sessdata = _cookie_value(self._cookie, "SESSDATA")
+        identity = hashlib.sha256(sessdata.encode()).hexdigest()[:12] if sessdata else "anon"
+        return f"{identity}:{bvid}"
+
+    @classmethod
+    def _view_cache_get(cls, key: str) -> dict[str, Any] | None:
+        entry = cls._view_data_cache.get(key)
+        if entry is None:
+            return None
+        fetched_at, payload = entry
+        if time.monotonic() - fetched_at > cls._VIEW_DATA_CACHE_TTL_SECONDS:
+            cls._view_data_cache.pop(key, None)
+            return None
+        cls._view_data_cache.move_to_end(key)
+        return payload
+
+    @classmethod
+    def _view_cache_put(cls, key: str, payload: dict[str, Any]) -> None:
+        cls._view_data_cache[key] = (time.monotonic(), payload)
+        cls._view_data_cache.move_to_end(key)
+        while len(cls._view_data_cache) > cls._VIEW_DATA_CACHE_MAX_ENTRIES:
+            cls._view_data_cache.popitem(last=False)
+
     async def get_video_view_data(self, bvid: str) -> dict[str, Any]:
         """Fetch the /view data object, falling back to the WBI-signed endpoint.
 
@@ -590,9 +751,19 @@ class BilibiliAPIClient:
         for a given network/IP (HTTP 412). The WBI-signed sibling
         ``/x/web-interface/wbi/view`` is still accepted by the web API and is
         the standard web client path for this payload.
+
+        Successful payloads are cached process-wide for
+        ``_VIEW_DATA_CACHE_TTL_SECONDS`` (keyed by bvid + login identity) so a
+        discovery round that touches the same video through scoring, danmaku,
+        play info and save writes only issues one request; failures are never
+        cached.
         """
+        key = self._view_cache_key(bvid)
+        cached = self._view_cache_get(key)
+        if cached is not None:
+            return cached
         try:
-            return await self._get_json("/x/web-interface/view", params={"bvid": bvid})
+            data = await self._get_json("/x/web-interface/view", params={"bvid": bvid})
         except BilibiliAPIError as exc:
             if exc.code != -412:
                 raise
@@ -602,10 +773,12 @@ class BilibiliAPIClient:
             )
             img_key, sub_key = await self._get_wbi_keys()
             signed = self._sign_wbi_params({"bvid": bvid}, img_key=img_key, sub_key=sub_key)
-            return await self._get_json(
+            data = await self._get_json(
                 "/x/web-interface/wbi/view",
                 params=signed,
             )
+        self._view_cache_put(key, data)
+        return data
 
     async def get_video_info(self, bvid: str) -> VideoInfo:
         """Get video information by BV ID.
@@ -990,13 +1163,27 @@ class BilibiliAPIClient:
             List of search result dicts.
         """
         cooldown_remaining = self.search_cooldown_remaining()
+        probe = False
         if cooldown_remaining > 0:
-            logger.info(
-                "Bilibili search cooldown active (%.0fs left) — skipping query=%r",
-                cooldown_remaining,
-                keyword,
-            )
-            return []
+            if type(self)._consume_search_recovery_probe():
+                # Halfway through the cooldown: one single-attempt probe to
+                # discover a lifted block early instead of idling the full
+                # window out. A failed probe simply re-arms the cooldown via
+                # the normal 412 / v_voucher handlers below.
+                probe = True
+                logger.info(
+                    "Bilibili search recovery probe: cooldown has %.0fs left — "
+                    "testing recovery with a single request (query=%r)",
+                    cooldown_remaining,
+                    keyword,
+                )
+            else:
+                logger.info(
+                    "Bilibili search cooldown active (%.0fs left) — skipping query=%r",
+                    cooldown_remaining,
+                    keyword,
+                )
+                return []
 
         # v0.3.55+: 3 attempts with exponential backoff (was 2 with 1.5s
         # linear). Production logs (2026-05-05) showed 141 v_voucher
@@ -1013,7 +1200,7 @@ class BilibiliAPIClient:
         # (streak>0) we drop to a single quick probe — confirming a real
         # storm in a few fast attempts instead of hammering B站 with doomed
         # ~21s retry chains per keyword (which would only deepen the block).
-        max_attempts = 1 if type(self)._search_voucher_block_streak > 0 else 3
+        max_attempts = 1 if probe or type(self)._search_voucher_block_streak > 0 else 3
         backoff_schedule = (1.5, 5.0, 15.0)
         for attempt in range(max_attempts):
             try:
@@ -1103,7 +1290,14 @@ class BilibiliAPIClient:
                 return []
 
             results = _json_list(data.get("result", []))
-            self._reset_search_cooldown_backoff()
+            if probe:
+                self._clear_search_cooldown_after_probe()
+                logger.info(
+                    "Bilibili search recovery probe succeeded (query=%r) — cooldown cleared",
+                    keyword,
+                )
+            else:
+                self._reset_search_cooldown_backoff()
             if not results:
                 logger.debug("Search returned empty result for query=%r", keyword)
             return results

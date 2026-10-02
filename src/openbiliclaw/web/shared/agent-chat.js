@@ -7,7 +7,13 @@
  * one implementation of:
  *
  * - incremental SSE parsing for ``POST /api/chat/agent/stream``
- *   (``event: <type>\ndata: <json>\n\n`` frames, event name = AgentEvent type);
+ *   (``event: <type>\ndata: <json>\n\n`` frames, event name = AgentEvent type).
+ *   The backend also emits ``delta`` frames (``{type, step, text}``) with
+ *   incremental reply fragments; they are intentionally NOT reduced into
+ *   the run model (history replay rebuilds text from ``thinking`` /
+ *   ``final``) — each frontend renders them live on its own. Unknown event
+ *   names are ignored by ``applyAgentEvent``, so old frontends tolerate
+ *   the new frames;
  * - reducing the event stream (or a persisted ``payload.agent_events`` array)
  *   into a "process flow" run model (steps / tool calls / approvals /
  *   skill-switch suggestions / background-task proposals / final / error);

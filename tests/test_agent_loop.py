@@ -335,6 +335,8 @@ class TestAgentLoopSimulatedFallback:
         assert [event.type for event in events] == [
             "tool_call",
             "tool_result",
+            # The simulated final hop streams as one buffered delta chunk.
+            "delta",
             "final",
         ]
         assert events[0].tool_name == "get_profile"

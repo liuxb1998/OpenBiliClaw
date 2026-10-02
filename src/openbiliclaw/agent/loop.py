@@ -19,13 +19,15 @@ import logging
 from dataclasses import dataclass, field
 from typing import TYPE_CHECKING, Any, Literal, Protocol
 
+from openbiliclaw.llm.base import LLMResponseError
+
 from .tools.registry import validate_tool_arguments
 
 if TYPE_CHECKING:
     from collections.abc import AsyncIterator, Mapping
 
     from openbiliclaw.config import Config
-    from openbiliclaw.llm.base import LLMResponse
+    from openbiliclaw.llm.base import LLMResponse, LLMStreamChunk
 
     from .tools import ToolRegistry
 
@@ -39,6 +41,7 @@ AgentEventType = Literal[
     "tool_call",
     "tool_result",
     "approval_request",
+    "delta",
     "final",
     "step_limit_reached",
 ]
@@ -72,6 +75,18 @@ class SupportsNativeToolCompletion(Protocol):
         bypass_semaphore: bool = False,
     ) -> LLMResponse: ...
 
+    def stream_complete_with_native_tools(
+        self,
+        *,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        caller: str = "",
+        temperature: float = 0.7,
+        max_tokens: int = 4096,
+        reasoning_effort: str | None = None,
+        bypass_semaphore: bool = False,
+    ) -> AsyncIterator[LLMStreamChunk]: ...
+
 
 class SupportsApprovalGate(Protocol):
     """The slice of ``ApprovalStore`` the agent loop depends on (M7).
@@ -103,8 +118,11 @@ class AgentEvent:
     text), ``tool_call`` (name + arguments + summary), ``tool_result``
     (truncated result text + ok flag), ``approval_request`` (M7: a
     hard_write call was intercepted and parked as a pending approval,
-    carrying ``approval_id`` + ``impact``), ``final`` (the reply text) and
-    ``step_limit_reached`` (emitted once before the wrap-up ``final``).
+    carrying ``approval_id`` + ``impact``), ``delta`` (an incremental token
+    fragment of the current hop's assistant text, for live rendering only —
+    the authoritative text still arrives in ``thinking`` / ``final``),
+    ``final`` (the reply text) and ``step_limit_reached`` (emitted once
+    before the wrap-up ``final``).
     """
 
     type: AgentEventType
@@ -234,7 +252,12 @@ class AgentLoop:
         step = 0
         while step < self._max_steps:
             step += 1
-            response = await self._complete(messages, tool_schemas)
+            terminal: list[LLMResponse] = []
+            async for delta_event in self._stream_hop(
+                messages, tool_schemas, step=step, terminal=terminal
+            ):
+                yield delta_event
+            response = terminal[0]
             text = (response.content or "").strip()
             calls = self._normalize_tool_calls(response)
             if not calls:
@@ -356,8 +379,12 @@ class AgentLoop:
         )
         messages.append({"role": "user", "content": _STEP_LIMIT_WRAP_UP_INSTRUCTION})
         try:
-            wrap_up = await self._complete(messages, [])
-            wrap_up_text = (wrap_up.content or "").strip()
+            terminal = []
+            async for delta_event in self._stream_hop(
+                messages, [], step=self._max_steps, terminal=terminal
+            ):
+                yield delta_event
+            wrap_up_text = (terminal[0].content or "").strip()
         except Exception:
             logger.exception("Agent loop wrap-up completion failed.")
             wrap_up_text = ""
@@ -382,6 +409,40 @@ class AgentLoop:
             max_tokens=self._max_tokens,
             bypass_semaphore=self._bypass_semaphore,
         )
+
+    async def _stream_hop(
+        self,
+        messages: list[dict[str, Any]],
+        tools: list[dict[str, Any]],
+        *,
+        step: int,
+        terminal: list[LLMResponse],
+    ) -> AsyncIterator[AgentEvent]:
+        """Run one loop hop, yielding ``delta`` events as content streams in.
+
+        The aggregated response is deposited into ``terminal`` (one item);
+        ``tool_calls`` deltas never surface as events — only visible content
+        text does. Services without ``stream_complete_with_native_tools``
+        (older duck-typed doubles) fall back to the one-shot ``_complete``.
+        """
+        stream_fn = getattr(self._llm, "stream_complete_with_native_tools", None)
+        if not callable(stream_fn):
+            terminal.append(await self._complete(messages, tools))
+            return
+        async for chunk in stream_fn(
+            messages=messages,
+            tools=tools,
+            caller=self._caller,
+            temperature=self._temperature,
+            max_tokens=self._max_tokens,
+            bypass_semaphore=self._bypass_semaphore,
+        ):
+            if chunk.delta:
+                yield AgentEvent(type="delta", step=step, text=chunk.delta)
+            if chunk.response is not None:
+                terminal.append(chunk.response)
+        if not terminal:
+            raise LLMResponseError("Streaming hop ended without a terminal response.")
 
     @staticmethod
     def _normalize_tool_calls(response: LLMResponse) -> list[_NormalizedToolCall]:

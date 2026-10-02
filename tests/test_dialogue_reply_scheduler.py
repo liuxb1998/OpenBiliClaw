@@ -302,7 +302,11 @@ def test_every_production_dialogue_respond_call_is_behind_stable_lease() -> None
     )
     assert "ctx.dialogue.respond" not in source
     assert "async with _dialogue_execution_lease() as current_dialogue:" in source
-    assert source.count("await _run_with_dialogue_execution(") == 5
+    assert source.count("await _run_with_dialogue_execution(") == 4
+    # The legacy /api/chat/stream path streams token deltas, so it cannot
+    # wrap the whole reply in one ``_run_with_dialogue_execution`` await;
+    # it holds the lease directly around the delta loop instead.
+    assert "async for delta in _respond_deltas(current_dialogue):" in source
     assert 'current_speculator = getattr(ctx.soul_engine, "_speculator", None)' in source
     assert 'current_speculator = getattr(ctx.soul_engine, "_avoidance_speculator", None)' in source
 
