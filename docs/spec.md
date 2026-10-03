@@ -680,6 +680,7 @@ local Desktop Web / extension Settings → write-only /api/config → private bo
 │  │ Cheaper Inference        │  │                        │   │
 │  └──────────────────────────┘  └────────────────────────┘   │
 │  可选视觉 / 弹幕预热：质心、关键帧、完整 document embedding；endpoint provenance + stable slot retry │
+│  Local embedding: auto GPU → runner failure → CPU → validated vector      │
 │  Desktop bundle: official Ollama.app runtime (ollama + runner dylibs/assets) │
 │  LLMService caller bucket → inherit global chain / custom chain │
 │  cognition named views → task gate: awareness_confusions compact; others legacy │

@@ -632,10 +632,12 @@ The whole loop stays local — the agent host just calls the CLI bridge; your pr
 - 📦 **Cross-Machine Migration** — export/import portable config, SQLite, profiles, cookies, and the image cache from Desktop settings; imports are validated and staged, can be inspected or cancelled, then apply on restart with rollback copies. `.obcbackup` contains plaintext secrets but excludes the source machine's API-login password, session-signing secret, and extension device keys
 - 🔬 **Self-Optimizing Eval Loops** — five modules each carry an LLM-as-judge loop that improves prompt quality over rounds
 - 🔒 **Fully Private** — SQLite, config, profiles, and caches stay local; LLM calls use your own key, and each instance is built for exactly one person
-- 🔌 **Local Embedding** — optional Ollama + bge-m3, CPU-only, no extra API key
+- 🔌 **Local Embedding** — optional Ollama + bge-m3, automatic acceleration with CPU fallback, no extra API key
 - 🔧 **Fully Controllable** — create multiple independent channels of the same LLM type and drag global or per-module failover chains; edit your profile or add custom Skills
 
 ## 🏛️ Architecture Overview
+
+Local embedding: `requests / diagnostics → Ollama automatic acceleration → valid vector; runner failure → CPU retry → validated result`. CPU selection is shared for the backend process lifetime; restarting retries automatic acceleration.
 
 Recommendation requests: `main API → default dedicated recommendation process → current SQLite candidates → full ranking → atomic commit → cards + total/platform inventory`. The main API relays inventory events and observes background refills while clients are connected.
 
