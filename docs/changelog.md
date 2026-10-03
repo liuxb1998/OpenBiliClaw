@@ -6,6 +6,8 @@
 
 ### 修复：本地向量模型自动回退 CPU（2026-10-04）
 
+- 本机真实端到端复验通过：独立 Ollama + 应用 HTTP + 浏览器按钮，实际终止 runner 后恢复、8 次并发、CPU 持续失败与恢复、进程重启、1024 维向量及 SQLite 缓存均已核验；[实测证据](testing/2026-10-04-ollama-cpu-fallback.md#本机端到端复验真实进程故障真实-http真实向量)。Intel Mac 实际使用 CPU，Windows GPU 迁移仍待对应硬件验收。
+
 - 本地 Ollama 向量请求先使用自动加速；遇到原生 runner 崩溃（包括 Windows `0xc0000409` / `0xc0000005`）、明确的 GPU / 内存分配错误或无效向量，原请求以 `num_gpu=0` 重试。同一后端进程的 endpoint/model 保持 CPU 到应用退出，正式调用与诊断共享选择。
 - CPU 返回有效向量才视为恢复；CPU 失败 / 无效向量不入缓存，回退后的健康探针超时不再乐观报告可用。缺模型、鉴权、路径错误、冷加载超时与远端服务不触发模式切换。
 - Windows 包保留 Vulkan 自动加速能力；CUDA/ROCm 仍按现有体积策略裁剪。桌面、移动 Web、插件与 CLI 共用后端逻辑，无新配置项或 UI 开关；详细行为见 [LLM 模块](modules/llm.md#本地-ollama-向量运行模式)，测试证据见 [验证记录](testing/2026-10-04-ollama-cpu-fallback.md)。
