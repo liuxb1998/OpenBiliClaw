@@ -215,11 +215,12 @@ After starting the backend, open `http://127.0.0.1:8420/web` (or just `http://12
 
 ## Recent Updates
 
-📌 Latest: **v0.3.225 (2026-10-01)**
+📌 Latest: **v0.3.226 (2026-10-04)**
 
-- **Paste a link in chat and the AI gets it (issue #83)**: Bilibili / Zhihu / Xiaohongshu links (b23.tv short links auto-expanded) are fetched into the conversation and recorded as positive preference signals — fetch failures never block the chat.
-- **Token-by-token streaming replies**: chat replies now type out live on web and CLI, with true streaming for OpenAI-compatible providers and graceful fallback elsewhere.
-- **Multiline input in the CLI**: Enter sends, Esc+Enter inserts a newline; non-interactive terminals fall back to single-line input.
+- **Automatic CPU fallback**: local Ollama embedding failures retry on CPU, reducing repeated errors and unnecessary model downloads.
+- **Web tools and editable notes**: chat can search public webpages, read links, correct notes, and request approval before deleting them.
+- **Smoother conversations**: choose from six styles per conversation, with fixes for drafts, streaming replies, and obstructed buttons across all three clients.
+- **More reliable Bilibili search**: processes share cooldown state, probe recovery halfway through the cooldown, and reuse cached video details.
 
 Full changelog: [docs/changelog.md](docs/changelog.md).
 
