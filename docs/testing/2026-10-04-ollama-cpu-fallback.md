@@ -82,7 +82,9 @@ HTTP 500，错误为 `llama runner process has terminated: signal: killed`。已
 [CPU 持续失败](assets/2026-10-04-ollama/ollama-real-cpu-failure.png)、
 [解除故障后恢复](assets/2026-10-04-ollama/ollama-real-cpu-restored.png)。
 临时服务进程组与测试浏览器均已关闭，测试脚本正常退出。
-本机原始执行脚本及日志保留于 worktree 的 `output/ollama-live-e2e/`（不纳入版本控制）。
+本机原始执行脚本及日志已归档至主工作区的
+`output/ollama-fallback-2026-10-04/raw-output/ollama-live-e2e/`（不纳入版本控制）；
+截图与浏览器轨迹也在该归档目录中，清理测试 worktree 后仍可复查。
 
 复验后回归命令（复用主工作区虚拟环境时必须指定当前 worktree 的 `PYTHONPATH`）：
 
